@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>RAG Admin Panel</title>
+    <style>
+        body { font-family: sans-serif; max-width: 800px; margin: 40px auto; padding: 20px; }
+        textarea { width: 100%; height: 300px; font-family: monospace; }
+        .success { color: green; background: #e6fffa; padding: 10px; border-radius: 4px; }
+        .error { color: red; background: #fff5f5; padding: 10px; border-radius: 4px; }
+        button { background: #3182ce; color: white; border: none; padding: 10px 20px; cursor: pointer; border-radius: 4px; }
+        button:hover { background: #2c5282; }
+    </style>
+</head>
+<body>
+    <h1>Manual Knowledge Sync</h1>
+
+    {% if success %}
+        <div class="success">{{ success }}</div>
+    {% endif %}
+    {% if error %}
+        <div class="error">{{ error }}</div>
+    {% endif %}
+
+    <form action="/admin/submit" method="post">
+        <input type="hidden" name="key" value="{{ key }}">
+
+        <p><strong>Admin Key:</strong> {{ key }}</p>
+
+        <label>Paste JSON Payload here (structure: { "client_id": "...", "pages": [...] }):</label><br><br>
+        <textarea name="json_data" placeholder='{
+  "client_id": "demo",
+  "pages": [
+    {
+      "url": "https://example.com/pricing",
+      "content": "Our Standard plan is $10/mo. The Pro plan is $20/mo."
+    }
+  ]
+}'></textarea>
+        <br><br>
+        <button type="submit">Sync Knowledge Base</button>
+    </form>
+</body>
+</html>
