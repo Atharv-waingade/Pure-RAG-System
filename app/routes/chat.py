@@ -25,7 +25,7 @@ def load_products():
             pass
     return []
 
-# Load Data Once
+# Load Data Once (Instant)
 PRODUCTS_DB = load_products()
 
 class QueryRequest(BaseModel):
@@ -35,7 +35,7 @@ class QueryRequest(BaseModel):
 def find_best_match(query, products):
     """
     Finds the best product based on keyword overlap.
-    Ultra-fast and uses 0 RAM.
+    Ultra-fast and uses 0 MB RAM.
     """
     query_words = query.lower().split()
     best_product = None
