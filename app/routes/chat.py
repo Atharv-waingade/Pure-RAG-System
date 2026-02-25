@@ -8,59 +8,100 @@ import re
 
 router = APIRouter()
 
-# --- 1. ROBUST DATA LOADER ---
+# --- 1. ROBUST DATA LOADER (The "Bloodhound") ---
 def load_products():
+    """
+    Locates and loads the products.json file from any standard directory.
+    Prevents 'File Not Found' errors on Render.
+    """
     current_file = os.path.abspath(__file__)
     app_dir = os.path.dirname(os.path.dirname(current_file))
     root_dir = os.path.dirname(app_dir)
-    json_path = os.path.join(root_dir, "data", "products.json")
     
-    if os.path.exists(json_path):
-        try:
-            with open(json_path, "r") as f:
-                data = json.load(f)
-                return data.get("products", []) if isinstance(data, dict) else data
-        except:
-            pass
+    # List of possible hiding spots for the data
+    possible_paths = [
+        os.path.join(root_dir, "data", "products.json"),
+        os.path.join(root_dir, "clients", "beauty_store", "data", "products.json"),
+        os.path.join(root_dir, "products.json")
+    ]
+    
+    for path in possible_paths:
+        if os.path.exists(path):
+            try:
+                with open(path, "r") as f:
+                    data = json.load(f)
+                    items = data.get("products", []) if isinstance(data, dict) else data
+                    print(f"✅ SUCCESS: Loaded {len(items)} products from {path}")
+                    return items
+            except Exception as e:
+                print(f"⚠️ Found file at {path} but failed to load: {e}")
+                
+    print("❌ CRITICAL: Could not find products.json in any expected folder.")
     return []
 
+# Load Data Immediately on Startup
 PRODUCTS_DB = load_products()
 
 class QueryRequest(BaseModel):
     query: str
 
-# --- 2. INTELLIGENT SEARCH ENGINE ---
+# --- 2. HIGH IQ SEARCH ENGINE (The "Brain") ---
 def find_best_match(query, products):
-    # A. INTELLIGENCE: STOP WORDS
-    # We remove these "noise" words so the AI focuses on what matters
-    stop_words = {"show", "me", "the", "a", "an", "i", "want", "to", "buy", "find", "looking", "for", "is", "are", "some", "suggest", "something"}
+    """
+    Intelligent search logic that handles:
+    - Plurals (Lipsticks -> Lipstick)
+    - Synonyms (Parfum -> Fragrance)
+    - Typos (Lipstik -> Lipstick)
+    - Compound Words (Nailpolish -> Nail Polish)
+    """
+    # A. PRE-PROCESSING
+    clean_query = query.lower()
     
-    # Clean and tokenize the query
-    # We use regex to split by any non-letter character
-    raw_words = re.findall(r'\w+', query.lower())
+    # Fix common compound words manually
+    replacements = {
+        "nailpolish": "nail polish",
+        "eyeshadow": "eye shadow",
+        "sunblock": "sun block",
+        "lipsticks": "lipstick",
+        "perfumes": "perfume",
+        "scents": "scent"
+    }
+    for bad, good in replacements.items():
+        clean_query = clean_query.replace(bad, good)
+
+    # B. STOP WORDS REMOVAL
+    # Remove noise words to focus on the actual intent
+    stop_words = {"show", "me", "the", "a", "an", "i", "want", "to", "buy", "find", "looking", "for", "is", "are", "some", "suggest", "something", "in", "my", "of", "do", "you", "have"}
+    
+    raw_words = re.findall(r'\w+', clean_query)
     important_words = [w for w in raw_words if w not in stop_words]
     
-    # If the user ONLY typed stop words (e.g., "Show me"), we return nothing
-    if not important_words:
-        return None
+    # Auto-Singularize: If word ends in 's', add the singular version too
+    final_search_terms = list(important_words)
+    for w in important_words:
+        if w.endswith('s'):
+            final_search_terms.append(w[:-1])
 
-    # B. INTELLIGENCE: SYNONYMS
+    # C. SYNONYM EXPANSION
+    # Maps user slang to database terms
     synonyms = {
         "parfum": ["perfume", "fragrance", "scent", "cologne", "spray"],
         "scent": ["perfume", "fragrance", "parfum"],
-        "smell": ["perfume", "fragrance", "scent"],
-        "lipstick": ["lip", "color", "matte", "gloss", "stick"],
-        "rouge": ["blush", "cheek", "powder"],
+        "smell": ["perfume", "fragrance"],
+        "polish": ["nail", "lacquer", "enamel", "manicure"],
+        "nail": ["polish", "lacquer"],
+        "lipstick": ["lip", "color", "matte", "gloss", "stick", "tint", "balm"],
         "juice": ["drink", "beverage", "refreshing", "liquid"],
-        "creamy": ["smooth", "soft", "lotion", "moisturizer"],
-        "eye": ["shadow", "palette", "liner", "mascara", "lid"]
+        "shadow": ["eye", "palette", "lid"],
+        "rouge": ["blush", "cheek", "powder"],
+        "creamy": ["lotion", "moisturizer", "soft"]
     }
 
     # Expand query with synonyms
-    search_terms = list(important_words)
-    for word in important_words:
+    expanded_terms = list(final_search_terms)
+    for word in final_search_terms:
         if word in synonyms:
-            search_terms.extend(synonyms[word])
+            expanded_terms.extend(synonyms[word])
 
     best_product = None
     max_score = 0
@@ -68,41 +109,58 @@ def find_best_match(query, products):
     for product in products:
         score = 0
         
-        # Prepare Product Text
-        # We combine title, description, and category into one search field
+        # Create Search Blob (Title + Description + Category)
         prod_title = product.get('title', '').lower()
         prod_desc = product.get('description', '').lower()
         prod_cat = product.get('category', '').lower()
         
-        # Tokenize product text (split into list of words)
+        # Tokenize product text
         prod_words = re.findall(r'\w+', prod_title + " " + prod_desc + " " + prod_cat)
         
-        for term in search_terms:
-            # C. INTELLIGENCE: EXACT MATCH (High Points)
+        # D. SCORING LOGIC
+        matches_found = 0
+        
+        for term in expanded_terms:
+            term_matched = False
+            
+            # 1. Exact Word Match (3 points)
             if term in prod_words:
                 score += 3
+                term_matched = True
             
-            # D. INTELLIGENCE: FUZZY MATCH (Medium Points)
-            # This handles typos like "lipstik" -> "lipstick"
-            # get_close_matches looks for words that are 80% similar
-            elif difflib.get_close_matches(term, prod_words, n=1, cutoff=0.8):
+            # 2. Substring Match (1 point) - e.g. "lip" inside "lipstick"
+            elif any(term in pw for pw in prod_words):
                 score += 1
+                term_matched = True
+            
+            # 3. Fuzzy Match (2 points) - Handles typos like "fountation"
+            elif difflib.get_close_matches(term, prod_words, n=1, cutoff=0.85):
+                score += 2
+                term_matched = True
+            
+            if term_matched:
+                matches_found += 1
 
-        # Bonus: Title Match gets extra priority
-        for term in important_words:
+        # 4. Title Bonus (Critical!)
+        # If the word is in the TITLE, it's almost certainly what they want.
+        for term in final_search_terms:
              if term in prod_title:
                  score += 5
+
+        # E. PENALTY FOR PARTIAL MATCHES
+        # If user searched "Red Nailpolish" (2 concepts) and we only found "Red",
+        # we penalize the score to avoid showing Red Lipstick.
+        if len(final_search_terms) > 1 and matches_found < len(final_search_terms) / 2:
+             score = score / 2 
 
         if score > max_score:
             max_score = score
             best_product = product
             
-    # E. INTELLIGENCE: CONFIDENCE THRESHOLD
-    # If the score is too low (meaning we barely found anything), 
-    # we prefer to say "I don't know" rather than guessing wrong.
-    return best_product if max_score >= 2 else None
+    # Threshold: Score must be >= 3 to be considered a "Real Match"
+    return best_product if max_score >= 3 else None
 
-# --- 3. TEMPLATE ENGINE ---
+# --- 3. TEMPLATE ENGINE (The "Personality") ---
 def frame_response(product):
     title = product.get('title', 'This piece')
     price = product.get('price', 'N/A')
@@ -111,7 +169,8 @@ def frame_response(product):
     openers = [
         "I found exactly what you are looking for.",
         "An excellent choice. I have located this item in our vault.",
-        "Here is the piece that matches your inquiry."
+        "Here is the piece that matches your inquiry.",
+        "I believe this is the perfect match for your request."
     ]
     
     return (
@@ -122,11 +181,13 @@ def frame_response(product):
 @router.post("/chat")
 async def chat_endpoint(request: QueryRequest):
     global PRODUCTS_DB
+    
+    # Reload safety check (in case file was added after server start)
     if not PRODUCTS_DB:
         PRODUCTS_DB = load_products()
     
     if not PRODUCTS_DB:
-        return {"response": "My archives are empty. Please check the 'data' folder."}
+        return {"response": "My archives are currently empty. Please ensure 'data/products.json' is committed to the repository."}
 
     best_product = find_best_match(request.query, PRODUCTS_DB)
     
