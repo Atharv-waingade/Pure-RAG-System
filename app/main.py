@@ -5,7 +5,6 @@ from app.core.embedding_model import GlobalEmbeddingModel
 
 # Preload model on startup
 # This ensures the heavy AI model is loaded into memory before the first request comes in.
-GlobalEmbeddingModel.get_instance()
 
 app = FastAPI(title="Pure RAG SaaS", version="1.0.0")
 
