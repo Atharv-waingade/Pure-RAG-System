@@ -40,7 +40,7 @@ class DataManager:
                 p_res, r_res, c_res = await asyncio.gather(
                     client.get("https://dummyjson.com/products?limit=100"),
                     client.get("https://dummyjson.com/recipes?limit=100"),
-                    client.get("https://dummyjson.com/carts?limit=50"), # Fetch Carts
+                    client.get("https://dummyjson.com/carts?limit=50"),
                     return_exceptions=True
                 )
                 
@@ -66,12 +66,11 @@ inventory = DataManager()
 # ==============================================================================
 class MultiDomainEngine:
     def __init__(self):
-        self.stop_words = {"i", "me", "my", "we", "you", "is", "are", "was", "a", "an", "the", "and", "or", "of", "to", "in", "on", "show", "want", "buy", "find", "looking", "get", "any", "some", "available", "how", "make"}
+        self.stop_words = {"i", "me", "my", "we", "you", "is", "are", "was", "a", "an", "the", "and", "or", "of", "to", "in", "on", "show", "want", "buy", "find", "looking", "get", "any", "some", "available"}
         
-        # Domain Indexes
         self.p_idf, self.p_doc_len, self.p_map = {}, {}, {}
         self.r_idf, self.r_doc_len, self.r_map = {}, {}, {}
-        self.c_map = {} # Cart map is simpler (lookup by ID)
+        self.c_map = {} 
         self.p_avg_len, self.r_avg_len = 1, 1
 
     def _stem(self, word):
@@ -85,7 +84,6 @@ class MultiDomainEngine:
         text = re.sub(r'[^a-z0-9\s]', '', str(text).lower())
         return [self._stem(t) for t in text.split() if t not in self.stop_words]
 
-    # --- INDEX BUILDERS ---
     def build_product_index(self, products):
         self.p_map = {p['id']: p for p in products}
         df, total_len = defaultdict(int), 0
@@ -114,10 +112,8 @@ class MultiDomainEngine:
             self.r_idf[t] = math.log((len(recipes) - freq + 0.5) / (freq + 0.5) + 1)
 
     def build_cart_index(self, carts):
-        # We index carts purely by their ID as strings for fast lookup
         self.c_map = {str(c['id']): c for c in carts}
 
-    # --- TRAFFIC CONTROLLER ---
     def route_query(self, query):
         q = query.lower()
         
@@ -125,8 +121,8 @@ class MultiDomainEngine:
         if any(w in q for w in ["cart", "basket", "checkout", "my order"]):
             return "carts", "search"
 
-        # 2. Recipe Intent
-        if any(w in q for w in ["recipe", "cook", "bake", "ingredient", "meal", "dinner", "lunch", "breakfast", "food"]):
+        # 2. Recipe Intent (Fixed: Removed broad words like "food" and "cook")
+        if any(w in q for w in ["recipe", "how to make", "ingredients for", "dish", "cuisine"]):
             return "recipes", "search"
             
         # 3. Product Metadata Intents
@@ -139,21 +135,17 @@ class MultiDomainEngine:
         if "discount" in q or "final price" in q:
             return "products", "discount"
 
+        # Default to standard product search
         return "products", "search"
 
-    # --- DOMAIN: CARTS ---
     def search_carts(self, query):
-        # Find any number in the user's query (e.g., "Show me cart 5")
         numbers = re.findall(r'\d+', query)
         if numbers:
             target_id = numbers[0]
             if target_id in self.c_map:
                 return [self.c_map[target_id]]
-        
-        # If no number specified, or cart not found, return an empty list
         return []
 
-    # --- DOMAIN: RECIPES ---
     def search_recipes(self, query):
         search_tokens = self._tokenize(query)
         scores = defaultdict(float)
@@ -171,7 +163,6 @@ class MultiDomainEngine:
                 num = freq * 2.5 
                 den = freq + 1.5 * (0.25 + 0.75 * (self.r_doc_len[rid] / self.r_avg_len))
                 score += idf * (num / den)
-                
                 if token in self._tokenize(r.get('name', '')): score *= 2.0 
 
             if score > 0: scores[rid] = score
@@ -182,7 +173,6 @@ class MultiDomainEngine:
         results.sort(key=lambda x: scores[x['id']], reverse=True)
         return results[:3]
 
-    # --- DOMAIN: PRODUCTS ---
     def search_products(self, query):
         search_tokens = self._tokenize(query)
         search_tokens = [t for t in search_tokens if t not in ["under", "cheap", "price", "return", "policy", "cart"]]
@@ -200,7 +190,6 @@ class MultiDomainEngine:
                 num = freq * 2.5
                 den = freq + 1.5 * (0.25 + 0.75 * (self.p_doc_len[pid] / self.p_avg_len))
                 score += idf * (num / den)
-                
                 if token in self._tokenize(p.get('title', '')): score *= 2.5
                 if token in self._tokenize(p.get('brand', '')): score *= 2.0
 
@@ -215,10 +204,20 @@ class MultiDomainEngine:
 multi_brain = MultiDomainEngine()
 
 # ==============================================================================
-# 3. CONVERSATION HANDLER (Domain-Specific Formatting)
+# 3. CONVERSATION HANDLER (Personality & Formatting)
 # ==============================================================================
 class ConversationHandler:
     
+    # RESTORED: The Personality Block
+    def handle_chit_chat(self, text):
+        q = text.lower().strip()
+        greetings = ["hi", "hello", "hey", "greetings"]
+        if any(w == q for w in greetings) or any(q.startswith(w + " ") for w in greetings):
+            return "Welcome to Maison Luxe. I am your digital concierge. I can find products, provide recipes, or check your cart. How may I assist you?"
+        if "thank" in q or "appreciate" in q:
+            return "You are very welcome! Let me know if you need anything else."
+        return None
+
     def handle_product_logic(self, sub_intent, results):
         if not results: return "Please specify which product you are asking about."
         
@@ -279,7 +278,7 @@ class ConversationHandler:
         if not results: 
             return "I couldn't find that cart. Please specify the cart number (e.g., 'What is in cart 5?')."
         
-        c = results[0] # There will only be 1 exact match
+        c = results[0] 
         cart_id = c.get('id')
         total = safe_float(c.get('total', 0))
         discounted = safe_float(c.get('discountedTotal', 0))
@@ -290,7 +289,7 @@ class ConversationHandler:
         res += f"• **Subtotal:** ${total:.2f}<br>"
         res += f"• **Discounted Total:** ${discounted:.2f}<br><br>**Items in this cart:**<br>"
         
-        for item in items[:3]: # Show top 3 items to save space
+        for item in items[:3]: 
             res += f"  - {item.get('quantity')}x {item.get('title')} (${item.get('price')})<br>"
             
         if len(items) > 3:
@@ -312,6 +311,10 @@ async def chat_endpoint(request: QueryRequest):
     if not products: return {"response": "System Notice: Database unavailable."}
 
     query = request.query
+    
+    # RESTORED: Check for greetings before doing math
+    chit_chat = speaker.handle_chit_chat(query)
+    if chit_chat: return {"response": chit_chat}
     
     # 1. Traffic Controller
     domain, sub_intent = multi_brain.route_query(query)
