@@ -89,7 +89,6 @@ class SQLiteDataMirror:
         self.last_sync = 0
         self._lock = asyncio.Lock()
         
-        # Domain Vocabulary perfectly mapped to your 8 APIs
         self.domain_profiles = {
             "Materials": "material materials fabric raw component item physical",
             "Purchases": "purchase purchases order invoice receipt bought history",
@@ -126,10 +125,8 @@ class SQLiteDataMirror:
                 yield row
 
     def _load_to_sql(self, table_name, records):
-        """Dynamically builds SQL tables. Safely handles empty records (e.g. Customers)."""
         self.conn.execute(f'DROP TABLE IF EXISTS "{table_name}"')
         if not records: 
-            # Create a dummy table so it doesn't crash if queried while empty
             self.conn.execute(f'CREATE TABLE "{table_name}" ("Notice" TEXT)')
             return
             
@@ -158,7 +155,6 @@ class SQLiteDataMirror:
                     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
                 except: return False
                 
-                # Mapped exactly to your live backend
                 endpoints = {
                     "Materials": "/api/material/get-all-materials",
                     "Purchases": "/api/purchase/get-all-purchases",
@@ -187,11 +183,12 @@ class SQLiteDataMirror:
 db = SQLiteDataMirror()
 
 # ==============================================================================
-# 4. SEMANTIC SQL QUERY PLANNER
+# 4. SEMANTIC SQL QUERY PLANNER (With Domain Stripping Fix)
 # ==============================================================================
 class StructuredQueryPlanner:
     def __init__(self):
-        self.stopwords = {"show", "me", "find", "get", "what", "is", "the", "a", "an", "of", "for", "please", "can", "you", "tell", "details", "all"}
+        # Expanded fluff words to catch "we have", "names", "any", "in", etc.
+        self.stopwords = {"show", "me", "find", "get", "what", "is", "are", "the", "a", "an", "of", "for", "please", "can", "you", "tell", "details", "all", "we", "have", "our", "available", "names", "list", "give", "in", "any"}
 
     def execute_plan(self, query):
         clean_q = re.sub(r'[^a-zA-Z0-9\s-]', ' ', query.lower())
@@ -200,30 +197,27 @@ class StructuredQueryPlanner:
         
         if not tokens: return None, [], search_term
 
-        # 1. Semantic Routing (TF-IDF determines the correct SQL Table)
+        # 1. Semantic Routing
         scores = db.tfidf.score(search_term)
         best_table = max(scores, key=scores.get)
-        if scores[best_table] == 0.0: best_table = "Product Stocks" # Default fallback
+        if scores[best_table] == 0.0: best_table = "Product Stocks"
 
         # 2. Get Table Schema
         cursor = db.conn.cursor()
         cursor.execute(f'PRAGMA table_info("{best_table}")')
         columns = [row['name'] for row in cursor.fetchall()]
         
-        # Guard against empty APIs (like Customers)
         if not columns or columns == ["Notice"]:
             return best_table, [], search_term
 
         # 3. Dynamic Intent-to-SQL Parsing
         sql_clauses = {"WHERE": [], "ORDER BY": "", "LIMIT": ""}
         
-        # Detect Limits
         limit_match = re.search(r'top\s+(\d+)', search_term)
         if limit_match:
             sql_clauses["LIMIT"] = f"LIMIT {limit_match.group(1)}"
             search_term = re.sub(r'top\s+\d+', '', search_term)
 
-        # Detect Ordering
         numeric_cols = [c for c in columns if any(kw in c.lower() for kw in ["price", "amount", "qty", "quantity", "stock", "total", "balance"])]
         if numeric_cols:
             if any(w in search_term for w in ["highest", "most", "maximum", "top"]):
@@ -231,8 +225,16 @@ class StructuredQueryPlanner:
             elif any(w in search_term for w in ["lowest", "least", "minimum"]):
                 sql_clauses["ORDER BY"] = f'ORDER BY CAST("{numeric_cols[0]}" AS REAL) ASC'
 
-        # Remaining words are used for filtering
-        filter_term = " ".join([w for w in search_term.split() if w not in ["highest", "lowest", "most", "least", "maximum", "minimum", "top"]]).strip()
+        # --- THE KEYWORD BLEED FIX ---
+        # 1. Strip structural intent words
+        intent_words = ["highest", "lowest", "most", "least", "maximum", "minimum", "top"]
+        raw_filter_tokens = [w for w in search_term.split() if w not in intent_words]
+        
+        # 2. Strip domain mapping words so they aren't searched as literals inside the table
+        domain_keywords = db.domain_profiles[best_table].split()
+        final_filter_tokens = [w for w in raw_filter_tokens if w not in domain_keywords]
+        
+        filter_term = " ".join(final_filter_tokens).strip()
 
         # Build dynamic OR statements
         if filter_term:
@@ -254,7 +256,7 @@ class StructuredQueryPlanner:
         try:
             cursor.execute(base_sql, params)
             records = [dict(row) for row in cursor.fetchall()]
-            return best_table, records, filter_term
+            return best_table, records, filter_term # Returns clean filter term
         except Exception as e:
             print(f"SQL Error: {e}")
             return best_table, [], filter_term
@@ -262,7 +264,7 @@ class StructuredQueryPlanner:
 planner = StructuredQueryPlanner()
 
 # ==============================================================================
-# 5. CONVERSATIONAL INSIGHT GENERATOR (LLM-Style Responses)
+# 5. CONVERSATIONAL INSIGHT GENERATOR
 # ==============================================================================
 class LLMStyleFormatter:
     def _calculate_insights(self, records):
@@ -280,7 +282,7 @@ class LLMStyleFormatter:
 
     def create_human_response(self, domain, records, search_term):
         if not domain or not records:
-            return f"I've executed a secure SQL query against the **{domain}** registry, but couldn't locate any records matching **'{search_term}'**. The database might be empty or the spelling could be incorrect."
+            return f"I've searched the **{domain}** registry, but couldn't locate any records matching **'{search_term}'**. The database might be empty or the spelling could be incorrect."
 
         total_items = len(records)
         qty, amount = self._calculate_insights(records)
@@ -305,7 +307,6 @@ class LLMStyleFormatter:
         closing = " Here is the precise data table you requested:<br><br>"
         intro_paragraph = ack + action + found + insight_text + closing
 
-        # HTML Rendering
         raw_keys = set()
         for r in records: raw_keys.update(r.keys())
         visible_keys = [k for k in raw_keys if k not in {"id", "_id", "__v", "password", "jwtToken", "role", "permissions"}]
@@ -359,17 +360,14 @@ async def chat_endpoint(request: ChatRequest):
         return {"response": random.choice(["You're very welcome!", "My pleasure!"])}
 
     if q_lower in ["hi", "hello", "hey"]:
-        return {"response": "Hello! I am your Semantic SQL Planner. I map your natural English queries to deterministic SQL commands. Ask me for *'top 5 materials with highest price'* or *'show me supplier credits'*."}
+        return {"response": "Hello! I am your Semantic SQL Planner. I map your natural queries to deterministic SQL commands. Ask me for *'top 5 materials with highest price'* or *'show me supplier credits'*."}
 
-    # 1. Private Translation (Marathi/Hindi to English Intent)
     processed_query = private_preprocess(user_query)
 
-    # 2. Ensure SQL Mirror is populated
     success = await db.sync()
     if not success: 
         return {"response": "System Notice: Unable to securely connect to ERP APIs to build the SQL mirror."}
 
-    # 3. Semantic SQL Execution
     domain, results, search_term = planner.execute_plan(processed_query)
 
     return {"response": bot_voice.create_human_response(domain, results, search_term)}
