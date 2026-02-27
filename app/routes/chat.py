@@ -30,7 +30,6 @@ LOCAL_INTENT_MAP = {
 }
 
 def private_preprocess(query):
-    """Translates intent locally without calling external AI APIs."""
     q = query.lower()
     for english_intent, synonyms in LOCAL_INTENT_MAP.items():
         for syn in synonyms:
@@ -38,7 +37,7 @@ def private_preprocess(query):
     return q
 
 # ==============================================================================
-# 2. CUSTOM TF-IDF & COSINE SIMILARITY ENGINE (0MB Overhead)
+# 2. CUSTOM TF-IDF ENGINE
 # ==============================================================================
 class LightweightTFIDF:
     def __init__(self, corpus_dict):
@@ -80,7 +79,7 @@ class LightweightTFIDF:
         return scores
 
 # ==============================================================================
-# 3. IN-MEMORY SQLITE MIRROR (Fastest Offline Processing)
+# 3. IN-MEMORY SQLITE MIRROR
 # ==============================================================================
 class SQLiteDataMirror:
     def __init__(self):
@@ -101,28 +100,49 @@ class SQLiteDataMirror:
         }
         self.tfidf = LightweightTFIDF(self.domain_profiles)
 
+    def _extract_list(self, raw_json):
+        """Safely extracts the data array no matter how the ERP wraps it."""
+        if isinstance(raw_json, list): return raw_json
+        if isinstance(raw_json, dict):
+            if "data" in raw_json and isinstance(raw_json["data"], list): return raw_json["data"]
+            for v in raw_json.values():
+                if isinstance(v, list): return v
+        return []
+
     def _stream_flatten(self, dataset):
+        """FIXED: Safely unwraps nested objects so NO columns are lost!"""
         if not dataset or not isinstance(dataset, list): return
         for record in dataset:
             if not isinstance(record, dict):
                 yield {"Data": record}
                 continue
             
-            scalars = {k: v for k, v in record.items() if not isinstance(v, (list, dict))}
-            children = [v for v in record.values() if isinstance(v, list) and v and isinstance(v[0], dict)]
+            row_base = {}
+            list_children = []
             
-            if children:
-                for child_list in children:
+            for k, v in record.items():
+                if v is None:
+                    row_base[k] = "-"
+                elif not isinstance(v, (list, dict)):
+                    row_base[k] = v
+                elif isinstance(v, dict):
+                    # Unwraps objects (e.g. supplier: {name: "Vivek"} -> supplier: "Vivek")
+                    row_base[k] = v.get("name", v.get("title", str(v)))
+                elif isinstance(v, list) and v and isinstance(v[0], dict):
+                    list_children.append((k, v))
+            
+            if list_children:
+                for list_key, child_list in list_children:
                     for child in child_list:
-                        row = scalars.copy()
+                        row = row_base.copy()
                         for ck, cv in child.items():
-                            row[ck] = cv.get("name", "Data") if isinstance(cv, dict) else cv
+                            if isinstance(cv, dict):
+                                row[ck] = cv.get("name", cv.get("title", str(cv)))
+                            elif not isinstance(cv, list):
+                                row[ck] = cv
                         yield row
             else:
-                row = scalars.copy()
-                for k, v in record.items():
-                    if isinstance(v, dict): row[k] = v.get("name", "Data")
-                yield row
+                yield row_base
 
     def _load_to_sql(self, table_name, records):
         self.conn.execute(f'DROP TABLE IF EXISTS "{table_name}"')
@@ -172,8 +192,7 @@ class SQLiteDataMirror:
                 for i, key in enumerate(endpoints.keys()):
                     res = responses[i]
                     if not isinstance(res, Exception) and res.status_code == 200:
-                        raw = res.json()
-                        data_list = raw.get("data", raw) if isinstance(raw, dict) else raw
+                        data_list = self._extract_list(res.json())
                         flat_records = list(self._stream_flatten(data_list))
                         self._load_to_sql(key, flat_records)
             
@@ -183,12 +202,12 @@ class SQLiteDataMirror:
 db = SQLiteDataMirror()
 
 # ==============================================================================
-# 4. SEMANTIC SQL QUERY PLANNER (With Domain Stripping Fix)
+# 4. SEMANTIC SQL QUERY PLANNER
 # ==============================================================================
 class StructuredQueryPlanner:
     def __init__(self):
-        # Expanded fluff words to catch "we have", "names", "any", "in", etc.
-        self.stopwords = {"show", "me", "find", "get", "what", "is", "are", "the", "a", "an", "of", "for", "please", "can", "you", "tell", "details", "all", "we", "have", "our", "available", "names", "list", "give", "in", "any"}
+        # Added common spelling typos like "availlable" to prevent failed searches
+        self.stopwords = {"show", "me", "find", "get", "what", "is", "are", "the", "a", "an", "of", "for", "please", "can", "you", "tell", "details", "all", "we", "have", "our", "available", "availlable", "availble", "names", "list", "give", "in", "any"}
 
     def execute_plan(self, query):
         clean_q = re.sub(r'[^a-zA-Z0-9\s-]', ' ', query.lower())
@@ -197,12 +216,10 @@ class StructuredQueryPlanner:
         
         if not tokens: return None, [], search_term
 
-        # 1. Semantic Routing
         scores = db.tfidf.score(search_term)
         best_table = max(scores, key=scores.get)
         if scores[best_table] == 0.0: best_table = "Product Stocks"
 
-        # 2. Get Table Schema
         cursor = db.conn.cursor()
         cursor.execute(f'PRAGMA table_info("{best_table}")')
         columns = [row['name'] for row in cursor.fetchall()]
@@ -210,7 +227,6 @@ class StructuredQueryPlanner:
         if not columns or columns == ["Notice"]:
             return best_table, [], search_term
 
-        # 3. Dynamic Intent-to-SQL Parsing
         sql_clauses = {"WHERE": [], "ORDER BY": "", "LIMIT": ""}
         
         limit_match = re.search(r'top\s+(\d+)', search_term)
@@ -225,23 +241,18 @@ class StructuredQueryPlanner:
             elif any(w in search_term for w in ["lowest", "least", "minimum"]):
                 sql_clauses["ORDER BY"] = f'ORDER BY CAST("{numeric_cols[0]}" AS REAL) ASC'
 
-        # --- THE KEYWORD BLEED FIX ---
-        # 1. Strip structural intent words
+        # Keyword Bleed Fix: Strip out table names so "materials" doesn't become a strict string filter
         intent_words = ["highest", "lowest", "most", "least", "maximum", "minimum", "top"]
         raw_filter_tokens = [w for w in search_term.split() if w not in intent_words]
-        
-        # 2. Strip domain mapping words so they aren't searched as literals inside the table
         domain_keywords = db.domain_profiles[best_table].split()
         final_filter_tokens = [w for w in raw_filter_tokens if w not in domain_keywords]
         
         filter_term = " ".join(final_filter_tokens).strip()
 
-        # Build dynamic OR statements
         if filter_term:
             conditions = [f'"{col}" LIKE ?' for col in columns]
             sql_clauses["WHERE"] = " OR ".join(conditions)
 
-        # 4. Construct and Execute
         base_sql = f'SELECT * FROM "{best_table}"'
         params = []
         
@@ -250,13 +261,15 @@ class StructuredQueryPlanner:
             params = [f"%{filter_term}%"] * len(columns)
             
         if sql_clauses["ORDER BY"]: base_sql += f' {sql_clauses["ORDER BY"]}'
+        
+        # Increased limit from 100 to 10,000 to ensure full data return
         if sql_clauses["LIMIT"]: base_sql += f' {sql_clauses["LIMIT"]}'
-        elif not sql_clauses["WHERE"]: base_sql += ' LIMIT 100'
+        elif not sql_clauses["WHERE"]: base_sql += ' LIMIT 10000'
 
         try:
             cursor.execute(base_sql, params)
             records = [dict(row) for row in cursor.fetchall()]
-            return best_table, records, filter_term # Returns clean filter term
+            return best_table, records, filter_term 
         except Exception as e:
             print(f"SQL Error: {e}")
             return best_table, [], filter_term
@@ -310,7 +323,9 @@ class LLMStyleFormatter:
         raw_keys = set()
         for r in records: raw_keys.update(r.keys())
         visible_keys = [k for k in raw_keys if k not in {"id", "_id", "__v", "password", "jwtToken", "role", "permissions"}]
-        priority_keys = ["productName", "name", "firstName", "lastName", "supplierName", "materialName", "email", "phone", "stockQuantity", "sellPrice", "totalAmount"]
+        
+        # Updated priority headers to match the newly unwrapped objects
+        priority_keys = ["productName", "name", "firstName", "lastName", "supplierName", "supplier", "product", "customer", "materialName", "email", "phone", "stockQuantity", "sellPrice", "totalAmount"]
         headers = sorted(visible_keys, key=lambda x: priority_keys.index(x) if x in priority_keys else 99)
 
         html = "<div style='overflow-x:auto; margin-top:10px; border-radius:8px; box-shadow:0 4px 6px -1px rgba(0,0,0,0.1);'>"
