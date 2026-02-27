@@ -64,8 +64,7 @@ class AdminDataManager:
         }
         self.headers = {"Content-Type": "application/json"}
         self._lock = asyncio.Lock()
-        self.ready = False
-        self.last_fetched = 0
+        self.ready, self.last_fetched = False, 0
 
     async def force_refresh(self):
         async with self._lock: await self._load_all_data()
@@ -124,165 +123,173 @@ class AdminDataManager:
 admin_data = AdminDataManager()
 
 # ==============================================================================
-# 2. HYBRID FUZZY-LOGIC ENGINE 
+# 2. UNIVERSAL NLP SEARCH ENGINE (Zero Hardcoded Routing Rules)
 # ==============================================================================
-class HybridSearchEngine:
+class UniversalNLPEngine:
     def __init__(self):
-        self.ignore_words = {"show", "me", "find", "get", "what", "is", "are", "the", "a", "of", "for", "to", "all", "list", "details", "search", "available", "currently", "data", "history", "could", "you", "please", "fetch", "check", "display", "tell", "about", "can", "i", "see", "any", "some", "give"}
+        # NLP Stopwords: These are universally ignored to extract pure intent.
+        self.stopwords = {
+            "show", "me", "find", "get", "what", "is", "are", "the", "a", "an", "of", "for", "to", "all", "list", 
+            "details", "search", "available", "currently", "data", "history", "could", "you", "please", 
+            "fetch", "check", "display", "tell", "about", "can", "i", "see", "any", "some", "give", "that", 
+            "right", "now", "we", "have", "in", "stock", "which", "do", "does", "want", "need", "like", 
+            "would", "my", "our", "those", "these", "there", "their", "here", "it", "on", "at", "by", "with", "looking"
+        }
         
-        self.domain_map = {
-            "product_stocks": ["stock", "inventory", "product", "item", "warehouse"],
-            "supplier_purchases": ["purchase history", "supplier history"], 
-            "suppliers": ["supplier", "vendor", "distributor"],
-            "purchases": ["purchase", "invoice", "order", "bought", "receipt"],
-            "customers": ["customer", "client", "buyer"],
-            "materials": ["material", "raw", "fabric", "component"],
-            "supplier_credits": ["credit", "refund", "owe", "due", "money owed"],
-            "supplier_ledger": ["ledger", "statement", "balance", "account"],
-            "categories": ["category", "categories", "types"]
+        # Used ONLY to detect if the user asked for a whole category (e.g. "show all materials")
+        self.category_synonyms = {
+            "supplier_purchases": ["supplier", "purchase", "history"], 
+            "supplier_credits": ["supplier", "credit", "credits", "refund", "owe", "due"],
+            "supplier_ledger": ["supplier", "ledger", "statement", "balance"],
+            "product_stocks": ["product", "stock", "stocks", "inventory", "item", "warehouse", "qty"],
+            "suppliers": ["supplier", "suppliers", "vendor", "distributor"],
+            "purchases": ["purchase", "purchases", "invoice", "order", "receipt"],
+            "customers": ["customer", "customers", "client", "buyer"],
+            "materials": ["material", "materials", "raw", "fabric", "component"],
+            "categories": ["category", "categories", "type", "types"]
         }
 
     def translate_query(self, query):
         try: return GoogleTranslator(source='auto', target='en').translate(query)
         except: return query
 
-    def _extract_search_term(self, query):
-        q_clean = re.sub(r'[^a-zA-Z0-9\s-]', '', query.lower())
-        tokens = q_clean.split()
-        target_tokens = [t for t in tokens if t not in self.ignore_words and not any(t in words for words in self.domain_map.values())]
-        return " ".join(target_tokens).strip()
+    def search(self, query, datasets):
+        """
+        No guessing. Scans all datasets universally. Scores tokens mathematically. 
+        """
+        # 1. Clean and Tokenize
+        q_clean = re.sub(r'[^a-zA-Z0-9\s]', ' ', query.lower())
+        tokens = [w for w in q_clean.split() if w not in self.stopwords]
+        
+        if not tokens:
+            return None, [], ""
 
-    def route_query(self, query):
-        q = query.lower()
-        for domain, keywords in self.domain_map.items():
-            if any(w in q for w in keywords): return domain
-        return None 
+        # 2. Check Intent: Did they just ask for an entire database? (e.g. "get me all materials")
+        for domain, syns in self.category_synonyms.items():
+            if any(t in syns for t in tokens):
+                # Check if EVERY meaningful word they typed belongs to this category's name
+                remaining = [t for t in tokens if t not in syns]
+                if not remaining:
+                    return domain, datasets.get(domain, []), "" # Return whole database
 
-    def search_dataset(self, dataset, search_term):
-        if not search_term: return dataset 
-        search_words = search_term.lower().split()
-        scored_matches = []
+        # 3. Universal Deep Search: Score every record across ALL databases based on tokens
+        search_str = " ".join(tokens)
+        domain_results = {}
 
-        for record in dataset:
-            record_str = " ".join([str(v).lower() for v in record.values() if v is not None]) if isinstance(record, dict) else str(record).lower()
-
-            if search_term.lower() in record_str: scored_matches.append((record, 1.0))
-            elif all(w in record_str for w in search_words): scored_matches.append((record, 0.9))
-            else:
-                for word in search_words:
-                    if len(word) > 4:
-                        for rec_word in record_str.split():
-                            if difflib.SequenceMatcher(None, word, rec_word).quick_ratio() > 0.8:
-                                scored_matches.append((record, 0.7))
-                                break
-
-        scored_matches.sort(key=lambda x: x[1], reverse=True)
-        unique_results, seen = [], set()
-        for rec, score in scored_matches:
-            if str(rec) not in seen:
-                unique_results.append(rec)
-                seen.add(str(rec))
-            if len(unique_results) >= 25: break # Cap at 25 for Admin deep dives
+        for domain_name, records in datasets.items():
+            matched_records = []
+            for rec in records:
+                rec_str = " ".join([str(v).lower() for v in rec.values() if v is not None]) if isinstance(rec, dict) else str(rec).lower()
+                # Split record into distinct words to prevent "owe" matching "flower"
+                rec_tokens = set(re.sub(r'[^a-zA-Z0-9\s]', ' ', rec_str).split())
+                
+                score = 0
+                
+                # Bonus for exact phrase
+                if search_str in rec_str: score += 100
+                
+                # Individual word matching
+                for t in tokens:
+                    if t in rec_tokens: 
+                        score += 10 # Exact distinct word match
+                    else:
+                        # Typo tolerance for longer words
+                        if len(t) > 3:
+                            for rt in rec_tokens:
+                                if difflib.SequenceMatcher(None, t, rt).ratio() > 0.85:
+                                    score += 5
+                                    break
+                                    
+                if score > 0:
+                    matched_records.append((rec, score))
             
-        return unique_results
+            if matched_records:
+                # Sort by highest score
+                matched_records.sort(key=lambda x: x[1], reverse=True)
+                highest_score = matched_records[0][1]
+                # Filter out garbage matches (must be at least 50% as good as the best match)
+                filtered_records = [r[0] for r in matched_records if r[1] >= (highest_score * 0.5)]
+                domain_results[domain_name] = {"records": filtered_records, "max_score": highest_score}
 
-admin_brain = HybridSearchEngine()
+        # 4. Resolve the Best Database
+        if not domain_results:
+            return None, [], search_str
+
+        # Pick the domain that had the absolute highest scoring matches
+        best_domain = max(domain_results.keys(), key=lambda d: domain_results[d]["max_score"])
+        return best_domain, domain_results[best_domain]["records"], search_str
+
+admin_brain = UniversalNLPEngine()
 
 # ==============================================================================
-# 3. HUMAN INSIGHTS & FORMATTER (The "Brain")
+# 3. HUMAN INSIGHTS & FORMATTER
 # ==============================================================================
 class HumanAgentFormatter:
     def _generate_analytical_summary(self, records):
-        """Acts like a human analyst: calculates totals and quantities before showing the table."""
         if not records or not isinstance(records[0], dict): return ""
-        
         total_items = len(records)
-        sum_qty, sum_amount = 0.0, 0.0
-        qty_found, amount_found = False, False
+        sum_qty, sum_amount, qty_found, amount_found = 0.0, 0.0, False, False
 
         for rec in records:
             for k, v in rec.items():
                 k_lower = k.lower()
-                # Safely try to cast values to floats if they look like numbers
                 try:
                     num_val = float(v)
                     if any(w in k_lower for w in ["qty", "quantity", "stock"]):
                         sum_qty += num_val
                         qty_found = True
-                    if any(w in k_lower for w in ["total", "amount", "price", "balance", "credit"]):
-                        # Avoid summing "pricePerUnit", only total amounts
-                        if "unit" not in k_lower: 
-                            sum_amount += num_val
-                            amount_found = True
+                    if any(w in k_lower for w in ["total", "amount", "price", "balance", "credit"]) and "unit" not in k_lower: 
+                        sum_amount += num_val
+                        amount_found = True
                 except: pass
 
         insights = []
-        if qty_found and sum_qty > 0:
-            insights.append(f"a total volume of **{int(sum_qty):,} units**")
-        if amount_found and sum_amount > 0:
-            insights.append(f"a total financial value of **₹ {sum_amount:,.2f}**")
+        if qty_found and sum_qty > 0: insights.append(f"a total volume of **{int(sum_qty):,} units**")
+        if amount_found and sum_amount > 0: insights.append(f"a total financial value of **₹ {sum_amount:,.2f}**")
 
-        if insights:
-            return f" I've analyzed these **{total_items} records** and calculated " + " and ".join(insights) + "."
-        return f" I found **{total_items} records** for you."
+        if insights: return f" I've analyzed these **{total_items} records** and calculated " + " and ".join(insights) + "."
+        return f" I have retrieved **{total_items} detailed records** for you."
 
-    def format_as_table(self, domain, records, search_term, is_global=False):
+    def format_as_table(self, domain, records, search_term):
         domain_name = domain.replace("_", " ").title()
         
-        # 1. Dynamic Human Variations
-        success_intros = [
-            "Absolutely. ", "Right away. ", "Here is what you requested. ", 
-            "I've pulled that up for you. ", "I have the data ready. "
-        ]
-        fail_intros = [
-            "I've run a deep scan, but ", "I checked our current database, and ",
-            "It seems "
-        ]
-        
         if not records:
-            if search_term: return f"{random.choice(fail_intros)}I couldn't find any **{domain_name}** matching **'{search_term}'**. Would you like me to search for something else?"
-            return f"{random.choice(fail_intros)}the **{domain_name}** database appears to be empty right now."
+            return f"I ran a deep scan across the ERP, but I couldn't find any data matching **'{search_term}'**. Please verify the spelling or try a broader term."
 
-        # 2. Analytical Insight Generation
         summary = self._generate_analytical_summary(records)
 
-        if is_global:
-            intro = f"Since you didn't specify a category, I scanned the entire ERP system. I found this inside **{domain_name}** matching **'{search_term}'**.{summary}<br><br>"
-        elif search_term:
-            intro = f"{random.choice(success_intros)}Here is the filtered data for **'{search_term}'** in **{domain_name}**.{summary}<br><br>"
-        else:
-            intro = f"{random.choice(success_intros)}Here is the complete overview of all **{domain_name}**.{summary}<br><br>"
+        if search_term: intro = f"I searched the system and found the best matches for **'{search_term}'** in **{domain_name}**.{summary}<br><br>"
+        else: intro = f"Absolutely. I have fetched the complete database for **{domain_name}**.{summary}<br><br>"
 
-        # HANDLE FLAT STRINGS (Categories)
+        # FLAT STRINGS (Categories)
         if not isinstance(records[0], dict):
-            html = "<div style='margin-top: 15px; background: #ffffff; padding: 15px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);'>"
-            html += "<ul style='font-family: Arial, sans-serif; color: #374151; line-height: 1.8; margin: 0; padding-left: 20px;'>"
+            html = "<div style='margin-top: 15px; background: #ffffff; padding: 15px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);'><ul style='font-family: Arial, sans-serif; color: #374151; line-height: 1.8; margin: 0; padding-left: 20px;'>"
             for rec in records: html += f"<li style='margin-bottom: 5px;'><strong>{rec}</strong></li>"
             html += "</ul></div>"
             return intro + html
 
-        # HANDLE DICTIONARIES (Tables)
-        raw_keys = list(records[0].keys())
-        hidden_keys = {"id", "_id", "createdAt", "updatedAt", "createdBy", "updatedBy", "__v", "role", "permissions", "password"}
+        # DICTIONARIES (Tables)
+        raw_keys = set()
+        for r in records: raw_keys.update(r.keys())
+        
+        # Kept extremely minimal to ensure full detail visibility
+        hidden_keys = {"id", "_id", "__v", "password", "jwtToken", "role", "permissions"}
         visible_keys = [k for k in raw_keys if k not in hidden_keys]
 
-        # SMART SORTING
         priority_keys = ["productName", "name", "firstName", "lastName", "supplierName", "materialName", "email", "phone", "stockQuantity", "sellPrice", "totalAmount"]
         headers = sorted(visible_keys, key=lambda x: priority_keys.index(x) if x in priority_keys else 99)
 
         html = "<div style='overflow-x:auto; margin-top: 15px; border-radius: 8px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);'>"
         html += "<table style='border-collapse: collapse; width: 100%; font-family: Arial, sans-serif; text-align: left; background: #ffffff; min-width: 600px;'>"
-        
         html += "<tr style='background-color: #f8fafc; color: #475569; border-bottom: 2px solid #cbd5e1;'>"
         for h in headers:
-            clean_header = re.sub(r"([a-z])([A-Z])","\g<1> \g<2>", h).title().replace("Category Product Name", "Category") 
+            clean_header = re.sub(r"([a-z])([A-Z])", r"\g<1> \g<2>", h).title().replace("Category Product Name", "Category") 
             html += f"<th style='padding: 14px 16px; border: 1px solid #e2e8f0; font-size: 14px; white-space: nowrap;'>{clean_header}</th>"
         html += "</tr>"
 
         for i, rec in enumerate(records):
             bg_color = "#ffffff" if i % 2 == 0 else "#f8fafc"
             html += f"<tr style='background-color: {bg_color}; border-bottom: 1px solid #e2e8f0; transition: background-color 0.2s;'>"
-            
             for h in headers:
                 val = rec.get(h, "-")
                 if val is None or str(val).strip() == "": val = "-"
@@ -295,9 +302,8 @@ class HumanAgentFormatter:
                 elif isinstance(val, (int, float)) and any(kw in h.lower() for kw in ["price", "amount", "total", "balance", "credit"]):
                     val = f"₹ {val:,.2f}" 
                 
-                html += f"<td style='padding: 12px 16px; border: 1px solid #e2e8f0; color: #334155; font-size: 14px;'>{val}</td>"
+                html += f"<td style='padding: 12px 16px; border: 1px solid #e2e8f0; color: #334155; font-size: 14px; white-space: nowrap;'>{val}</td>"
             html += "</tr>"
-            
         html += "</table></div>"
         return intro + html
 
@@ -314,43 +320,24 @@ async def chat_endpoint(request: QueryRequest):
     translated_query = admin_brain.translate_query(request.query)
     q_lower = translated_query.lower()
 
-    # Dynamic Personality Routing
     if any(w in q_lower for w in ["refresh", "sync", "update records"]):
         await admin_data.force_refresh()
-        return {"response": "🔄 **Live Sync Complete.** I've re-authenticated with the Umbrella Inventory Server and downloaded the latest data for you. What shall we look at next?"}
+        return {"response": "🔄 **Live Sync Complete.** I've re-authenticated with the server and downloaded the latest data. What shall we look at next?"}
 
     if any(w in q_lower for w in ["thank you", "thanks"]):
-        responses = ["You are very welcome!", "My pleasure.", "Glad I could help. Let me know if you need any other reports."]
-        return {"response": random.choice(responses)}
+        return {"response": random.choice(["You are very welcome!", "My pleasure.", "Glad I could help."])}
 
     if any(w in q_lower for w in ["hi", "hello", "hey"]) and len(q_lower.split()) <= 3:
-        return {"response": "Hello! I am your AI Administrative Assistant. Though I'm an AI and don't have feelings, I am fully equipped to fetch, analyze, and organize your ERP data. Just ask me to search for an invoice, check stock levels, or view a supplier."}
+        return {"response": "Hello! I am your AI Administrative Assistant. I am fully equipped to fetch, analyze, and organize your ERP data without relying on rigid commands. Just type naturally and let me find the data for you."}
 
     data = await admin_data.get_data()
     if not any(data.values()): 
-        return {"response": "System Notice: I am currently unable to securely connect to the backend APIs. Please verify the network status or credentials."}
+        return {"response": "System Notice: I am unable to securely connect to the backend APIs. Please verify the network."}
 
-    domain = admin_brain.route_query(translated_query)
-    search_term = admin_brain._extract_search_term(translated_query)
+    # Universal Deep Search (No more brittle routing)
+    domain, results, search_term = admin_brain.search(translated_query, data)
 
-    # Global Search Fallback
     if not domain:
-        if not search_term:
-            return {"response": "I'm ready when you are. Could you please specify which data you'd like to pull? (e.g., 'Show me customers' or 'Find purchase INV-123')."}
-        
-        best_results, best_domain = [], None
-        for d_name, d_set in data.items():
-            res = admin_brain.search_dataset(d_set, search_term)
-            if len(res) > len(best_results):
-                best_results, best_domain = res, d_name
-        
-        if best_results:
-            return {"response": speaker.format_as_table(best_domain, best_results, search_term, is_global=True)}
-        else:
-            return {"response": f"I've searched across every department, but I couldn't find any records containing **'{search_term}'**. "}
+        return {"response": "Could you please provide a little more context or a specific search term? (e.g., 'Show me customers' or 'Find brass jug')."}
 
-    # Standard Filter
-    dataset = data.get(domain, [])
-    results = admin_brain.search_dataset(dataset, search_term)
-    
     return {"response": speaker.format_as_table(domain, results, search_term)}
