@@ -275,7 +275,7 @@ class HumanAgentFormatter:
         
         html += "<tr style='background-color: #f8fafc; color: #475569; border-bottom: 2px solid #cbd5e1;'>"
         for h in headers:
-            clean_header = re.sub("([a-z])([A-Z])","\g<1> \g<2>", h).title().replace("Category Product Name", "Category") 
+            clean_header = re.sub(r"([a-z])([A-Z])","\g<1> \g<2>", h).title().replace("Category Product Name", "Category") 
             html += f"<th style='padding: 14px 16px; border: 1px solid #e2e8f0; font-size: 14px; white-space: nowrap;'>{clean_header}</th>"
         html += "</tr>"
 
