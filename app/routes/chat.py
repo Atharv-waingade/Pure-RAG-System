@@ -101,7 +101,6 @@ class SQLiteDataMirror:
         self.tfidf = LightweightTFIDF(self.domain_profiles)
 
     def _extract_list(self, raw_json):
-        """Safely extracts the data array no matter how the ERP wraps it."""
         if isinstance(raw_json, list): return raw_json
         if isinstance(raw_json, dict):
             if "data" in raw_json and isinstance(raw_json["data"], list): return raw_json["data"]
@@ -110,7 +109,6 @@ class SQLiteDataMirror:
         return []
 
     def _stream_flatten(self, dataset):
-        """FIXED: Safely unwraps nested objects so NO columns are lost!"""
         if not dataset or not isinstance(dataset, list): return
         for record in dataset:
             if not isinstance(record, dict):
@@ -126,8 +124,9 @@ class SQLiteDataMirror:
                 elif not isinstance(v, (list, dict)):
                     row_base[k] = v
                 elif isinstance(v, dict):
-                    # Unwraps objects (e.g. supplier: {name: "Vivek"} -> supplier: "Vivek")
-                    row_base[k] = v.get("name", v.get("title", str(v)))
+                    # FIX: Safely extracts Invoice Numbers or Totals instead of dumping raw JSON
+                    display_val = v.get("name", v.get("title", v.get("invoiceNo", v.get("totalAmount", "Attached Record"))))
+                    row_base[k] = display_val
                 elif isinstance(v, list) and v and isinstance(v[0], dict):
                     list_children.append((k, v))
             
@@ -137,7 +136,7 @@ class SQLiteDataMirror:
                         row = row_base.copy()
                         for ck, cv in child.items():
                             if isinstance(cv, dict):
-                                row[ck] = cv.get("name", cv.get("title", str(cv)))
+                                row[ck] = cv.get("name", cv.get("title", cv.get("invoiceNo", "Record")))
                             elif not isinstance(cv, list):
                                 row[ck] = cv
                         yield row
@@ -206,7 +205,6 @@ db = SQLiteDataMirror()
 # ==============================================================================
 class StructuredQueryPlanner:
     def __init__(self):
-        # Added common spelling typos like "availlable" to prevent failed searches
         self.stopwords = {"show", "me", "find", "get", "what", "is", "are", "the", "a", "an", "of", "for", "please", "can", "you", "tell", "details", "all", "we", "have", "our", "available", "availlable", "availble", "names", "list", "give", "in", "any"}
 
     def execute_plan(self, query):
@@ -241,7 +239,6 @@ class StructuredQueryPlanner:
             elif any(w in search_term for w in ["lowest", "least", "minimum"]):
                 sql_clauses["ORDER BY"] = f'ORDER BY CAST("{numeric_cols[0]}" AS REAL) ASC'
 
-        # Keyword Bleed Fix: Strip out table names so "materials" doesn't become a strict string filter
         intent_words = ["highest", "lowest", "most", "least", "maximum", "minimum", "top"]
         raw_filter_tokens = [w for w in search_term.split() if w not in intent_words]
         domain_keywords = db.domain_profiles[best_table].split()
@@ -262,7 +259,6 @@ class StructuredQueryPlanner:
             
         if sql_clauses["ORDER BY"]: base_sql += f' {sql_clauses["ORDER BY"]}'
         
-        # Increased limit from 100 to 10,000 to ensure full data return
         if sql_clauses["LIMIT"]: base_sql += f' {sql_clauses["LIMIT"]}'
         elif not sql_clauses["WHERE"]: base_sql += ' LIMIT 10000'
 
@@ -277,54 +273,69 @@ class StructuredQueryPlanner:
 planner = StructuredQueryPlanner()
 
 # ==============================================================================
-# 5. CONVERSATIONAL INSIGHT GENERATOR
+# 5. HUMAN CONVERSATIONAL GENERATOR
 # ==============================================================================
 class LLMStyleFormatter:
     def _calculate_insights(self, records):
         if not records: return None, None
         sum_qty, sum_amount = 0.0, 0.0
+        
+        # FIX: Strict Mathematical Calculation to prevent "Trillion Rupee" Double-Counting
         for rec in records:
-            for k, v in rec.items():
-                k_lower = k.lower()
-                try:
-                    num = float(v)
-                    if any(w in k_lower for w in ["qty", "quantity", "stock"]): sum_qty += num
-                    if any(w in k_lower for w in ["total", "amount", "price", "balance", "credit"]) and "unit" not in k_lower: sum_amount += num
-                except: pass
+            # 1. Find ONE primary monetary value for this row
+            amount_added = False
+            for amt_key in ["totalAmount", "purchaseAmount", "creditAmount", "sellPrice"]:
+                actual_key = next((k for k in rec.keys() if k.lower() == amt_key.lower()), None)
+                if actual_key and not amount_added:
+                    try:
+                        sum_amount += float(str(rec[actual_key]).replace(',', ''))
+                        amount_added = True # Stop checking other amount columns to prevent double counting
+                    except ValueError: pass
+
+            # 2. Find ONE primary quantity value for this row
+            qty_added = False
+            for qty_key in ["stockQuantity", "quantity", "totalQuantity", "qty"]:
+                actual_key = next((k for k in rec.keys() if k.lower() == qty_key.lower()), None)
+                if actual_key and not qty_added:
+                    try:
+                        sum_qty += float(str(rec[actual_key]).replace(',', ''))
+                        qty_added = True
+                    except ValueError: pass
+
         return sum_qty if sum_qty > 0 else None, sum_amount if sum_amount > 0 else None
 
     def create_human_response(self, domain, records, search_term):
         if not domain or not records:
-            return f"I've searched the **{domain}** registry, but couldn't locate any records matching **'{search_term}'**. The database might be empty or the spelling could be incorrect."
+            return f"I've searched our **{domain}** records, but I couldn't find anything matching **'{search_term}'**. It's possible the database is empty or the specific item isn't logged yet."
 
         total_items = len(records)
         qty, amount = self._calculate_insights(records)
         
-        ack = random.choice(["Absolutely. ", "Right away. ", "I have the data ready. ", "Query executed successfully. "])
+        # FIX: More human-like, conversational phrasing
+        ack = random.choice(["I've got that for you. ", "Certainly! ", "Here is the data you requested. ", "All set. "])
         
         if search_term:
-            action = f"I translated your request into a secure SQL query against the **{domain}** registry"
-            found = f" and isolated **{total_items} relevant items**."
+            action = f"I scanned the **{domain}** database for **'{search_term}'**"
+            found = f" and found **{total_items} matching records**."
         else:
-            action = f"I've pulled the master list from the **{domain}** registry"
-            found = f" containing **{total_items} items**."
+            action = f"I've pulled the complete list of **{domain}**"
+            found = f", which currently contains **{total_items} records**."
 
         insight_text = ""
         if qty and amount:
-            insight_text = f" Based on deterministic calculations, these items represent a total volume of **{int(qty):,} units** with a financial sum of **₹{amount:,.2f}**."
+            insight_text = f" I've also tallied the totals: these represent a combined volume of **{int(qty):,} units** with a total financial value of **₹{amount:,.2f}**."
         elif amount:
-            insight_text = f" The total aggregated financial value of these records is **₹{amount:,.2f}**."
+            insight_text = f" The total financial value across these records amounts to **₹{amount:,.2f}**."
         elif qty:
-            insight_text = f" These records aggregate to a total volume of **{int(qty):,} units**."
+            insight_text = f" Combined, this accounts for a total of **{int(qty):,} units** in our system."
 
-        closing = " Here is the precise data table you requested:<br><br>"
+        closing = " Here is the detailed breakdown:<br><br>"
         intro_paragraph = ack + action + found + insight_text + closing
 
         raw_keys = set()
         for r in records: raw_keys.update(r.keys())
         visible_keys = [k for k in raw_keys if k not in {"id", "_id", "__v", "password", "jwtToken", "role", "permissions"}]
         
-        # Updated priority headers to match the newly unwrapped objects
         priority_keys = ["productName", "name", "firstName", "lastName", "supplierName", "supplier", "product", "customer", "materialName", "email", "phone", "stockQuantity", "sellPrice", "totalAmount"]
         headers = sorted(visible_keys, key=lambda x: priority_keys.index(x) if x in priority_keys else 99)
 
@@ -369,19 +380,21 @@ async def chat_endpoint(request: ChatRequest):
 
     if any(w in q_lower for w in ["refresh", "sync", "update records"]):
         await db.sync(force=True)
-        return {"response": "🔄 **SQL Mirror Synced.** I have securely updated the in-memory SQLite database with fresh ERP data. Awaiting your query."}
+        return {"response": "🔄 **System Synced.** I have successfully connected to the ERP and downloaded the latest live data. What would you like to see?"}
 
-    if q_lower in ["thank you", "thanks"]:
-        return {"response": random.choice(["You're very welcome!", "My pleasure!"])}
+    if q_lower in ["thank you", "thanks", "awesome", "perfect"]:
+        return {"response": random.choice(["You're very welcome! Let me know if you need any other reports.", "My pleasure! I'm here if you need more data."])}
 
-    if q_lower in ["hi", "hello", "hey"]:
-        return {"response": "Hello! I am your Semantic SQL Planner. I map your natural queries to deterministic SQL commands. Ask me for *'top 5 materials with highest price'* or *'show me supplier credits'*."}
+    # FIX: Robust Greeting Detection (catches "heyy", "heya", "hello there", etc.)
+    greet_words = ["hi", "hello", "hey", "heyy", "heya", "good morning", "good afternoon"]
+    if any(q_lower.startswith(g) for g in greet_words) and len(q_lower.split()) <= 3:
+        return {"response": "Hello! I am your AI Operations Assistant. You can ask me to analyze inventory, find specific purchase invoices, or check supplier credits. How can I help you today?"}
 
     processed_query = private_preprocess(user_query)
 
     success = await db.sync()
     if not success: 
-        return {"response": "System Notice: Unable to securely connect to ERP APIs to build the SQL mirror."}
+        return {"response": "System Notice: I am currently unable to securely connect to the ERP backend. Please verify your network."}
 
     domain, results, search_term = planner.execute_plan(processed_query)
 
