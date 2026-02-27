@@ -3,12 +3,14 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
-# Import your chatbot logic
+# Import your ERP AI Agent logic
 from app.routes import chat 
 
-app = FastAPI(title="Maison Luxe AI Concierge")
+# Updated title for your Enterprise Dashboard
+app = FastAPI(title="Umbrella AI")
 
-# Security
+# Security & CORS 
+# (This ensures your admin dashboard frontend can talk to this backend safely)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,7 +19,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Connect the chatbot route
+# Connect the AI Agent route
 app.include_router(chat.router)
 
 # --- BULLETPROOF STATIC FILES ---
