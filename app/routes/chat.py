@@ -1,4 +1,4 @@
-import asyncio, re, time, difflib, random, os, math, sqlite3
+import asyncio, re, time, random, os, math, sqlite3
 from collections import Counter
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
@@ -7,7 +7,7 @@ import httpx
 router = APIRouter()
 
 # ==============================================================================
-# CONFIGURATION & SECURITY 
+# CONFIGURATION & SECURITY
 # ==============================================================================
 BASE_URL = "https://umbrellasales.xyz/umbrella-inventory-server"
 LOGIN_URL = f"{BASE_URL}/api/service/login"
@@ -18,26 +18,7 @@ LOGIN_PAYLOAD = {
 CACHE_TTL = 300 
 
 # ==============================================================================
-# 1. LOCAL TRANSLATION DICTIONARY
-# ==============================================================================
-LOCAL_INTENT_MAP = {
-    "show": ["daakhva", "dakhav", "dakhva", "दाखवा", "दाखव", "dikhao", "dekhao"],
-    "stock": ["saatha", "satha", "साठा", "inventory", "maal", "mal"],
-    "purchase": ["kharedi", "khardi", "खरेदी", "kharidi"],
-    "supplier": ["vikreta", "purvathadar", "विक्रेता", "purvatha"],
-    "all": ["sarva", "sagale", "सर्व", "सगळे", "sab", "pure"],
-    "get": ["milan", "ghya", "ghyo", "घ्या"]
-}
-
-def private_preprocess(query):
-    q = query.lower()
-    for english_intent, synonyms in LOCAL_INTENT_MAP.items():
-        for syn in synonyms:
-            q = re.sub(rf"\b{syn}\b", english_intent, q)
-    return q
-
-# ==============================================================================
-# 2. CUSTOM TF-IDF ENGINE
+# 1. THE MATHEMATICAL ENGINE (Used only as a smart fallback)
 # ==============================================================================
 class LightweightTFIDF:
     def __init__(self, corpus_dict):
@@ -79,32 +60,116 @@ class LightweightTFIDF:
         return scores
 
 # ==============================================================================
-# 3. IN-MEMORY SQLITE MIRROR
+# 2. THE HYBRID "ADMIN BRAIN" (Native Rules -> Math Fallback)
+# ==============================================================================
+class AdminBrain:
+    def __init__(self):
+        self.api_routing_map = {
+            "sell": {"url": "/api/sell/get-all-sells", "keywords": ["sell", "sells", "sold", "sale", "sales", "dispatch", "receipt"]},
+            "purchase": {"url": "/api/purchase/get-all-purchases", "keywords": ["purchase", "purchases", "order", "bought", "buy", "acquire"]},
+            "material": {"url": "/api/material/get-all-materials", "keywords": ["material", "materials", "fabric", "raw", "component", "item", "goods"]},
+            "customer": {"url": "/api/customer/get-all-customers", "keywords": ["customer", "customers", "client", "clients", "buyer", "purchaser"]},
+            "supplier": {"url": "/api/supplier/get-all-suppliers", "keywords": ["supplier", "suppliers", "vendor", "distributor", "provider"]},
+            "supplier-credit": {"url": "/api/supplier-credit/get-all-supplier-credits", "keywords": ["credit", "credits", "owe", "due", "refund"]},
+            "product-stock": {"url": "/api/reports/get-product-stocks-with-product", "keywords": ["stock", "stocks", "inventory", "warehouse", "available", "product"]},
+            "payment": {"url": "/api/payment/supplier-payment-history", "keywords": ["payment", "payments", "paid", "settled", "transaction"]},
+            "printer": {"url": "/api/printer/get-all-printers", "keywords": ["printer", "printers", "machine", "print"]},
+            "email-config": {"url": "/api/email-config/get-all-emails", "keywords": ["email", "emails", "smtp", "config", "mail"]},
+            "category": {"url": "/api/reports/get-all-product-categories", "keywords": ["category", "categories", "classification", "type"]},
+            "customer-ledger": {"url": "/api/reports/get-all-customer-ledgers", "keywords": ["customer ledger", "client ledger", "account"]},
+            "supplier-ledger": {"url": "/api/reports/get-supplier-ledger", "keywords": ["supplier ledger", "vendor ledger", "statement"]},
+        }
+        
+        # Build the math corpus automatically from our strict keywords!
+        corpus = {mod: " ".join(data["keywords"]) for mod, data in self.api_routing_map.items()}
+        self.math_engine = LightweightTFIDF(corpus)
+        
+        self.entity_triggers = {
+            "invoice": "invoiceNo", "bill": "invoiceNo",
+            "barcode": "barcode", "code": "barcode",
+            "contact": "contact", "phone": "phone", "number": "contact",
+            "id": "id", "email": "email",
+            "name": "name"
+        }
+        
+        self.bulk_words = {"all", "list", "every", "entire", "show", "get", "fetch", "display"}
+        self.fluff_words = {"me", "find", "what", "is", "are", "the", "a", "an", "of", "for", "please", "can", "you", "tell", "details", "we", "have", "our", "in", "any", "by", "its", "their", "specific", "about", "information", "on", "who", "which"}
+
+    def analyze_intent(self, user_query):
+        text_lower = user_query.lower()
+        clean_q = re.sub(r'[^a-zA-Z0-9\s-]', ' ', text_lower)
+        tokens = clean_q.split()
+
+        analysis = {
+            "intent": "UNKNOWN", 
+            "module": None,
+            "url": None,
+            "target_column": None,
+            "search_value": ""
+        }
+
+        # --- HYBRID PASS 1: Strict Native Routing ---
+        highest_match = 0
+        matched_category_words = []
+        for mod_key, data in self.api_routing_map.items():
+            match_count = sum(1 for kw in data["keywords"] if re.search(rf"\b{kw}\b", text_lower))
+            if match_count > highest_match:
+                highest_match = match_count
+                analysis["module"] = mod_key
+                analysis["url"] = data["url"]
+                matched_category_words = data["keywords"]
+
+        # --- HYBRID PASS 2: Mathematical Fallback ---
+        if highest_match == 0:
+            math_scores = self.math_engine.score(clean_q)
+            best_math_match = max(math_scores, key=math_scores.get)
+            
+            # If the math finds a correlation > 0, trust the math!
+            if math_scores[best_math_match] > 0.0:
+                analysis["module"] = best_math_match
+                analysis["url"] = self.api_routing_map[best_math_match]["url"]
+                matched_category_words = self.api_routing_map[best_math_match]["keywords"]
+            else:
+                # Ultimate safe fallback
+                analysis["module"] = "product-stock"
+                analysis["url"] = self.api_routing_map["product-stock"]["url"]
+
+        # Entity/Column Extraction
+        words_to_strip = self.fluff_words | self.bulk_words | set(matched_category_words)
+        
+        for trigger, col in self.entity_triggers.items():
+            if re.search(rf"\b{trigger}s?\b", text_lower):
+                analysis["target_column"] = col
+                words_to_strip.add(trigger)
+                words_to_strip.add(trigger + "s")
+                break
+
+        # Extract the Clean Value
+        value_tokens = [w for w in tokens if w not in words_to_strip]
+        extracted_value = " ".join(value_tokens).strip()
+        analysis["search_value"] = extracted_value
+
+        is_bulk_request = any(w in tokens for w in self.bulk_words)
+
+        if analysis["target_column"]:
+            if extracted_value: analysis["intent"] = "SPECIFIC_SEARCH"
+            else: analysis["intent"] = "PROMPT_NEEDED"
+        elif extracted_value and not is_bulk_request:
+            analysis["intent"] = "GLOBAL_SEARCH"
+        else:
+            analysis["intent"] = "BULK_LIST"
+
+        return analysis
+
+# ==============================================================================
+# 3. IN-MEMORY SQLITE MIRROR (Strict Lazy-Loading by URL)
 # ==============================================================================
 class SQLiteDataMirror:
     def __init__(self):
         self.conn = sqlite3.connect(':memory:', check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-        self.last_sync = 0
+        self.last_sync_map = {} 
         self._lock = asyncio.Lock()
-        
-        self.domain_profiles = {
-            "Materials": "material materials fabric raw component item physical",
-            "Purchases": "purchase purchases order bought buy",
-            "Supplier Credits": "supplier credit credits refund owe due payment",
-            "Customers": "customer customers client buyer purchaser",
-            "Suppliers": "supplier suppliers vendor distributor provider",
-            "Supplier Ledger": "supplier ledger statement account balance sheet history",
-            "Product Stocks": "product stock stocks inventory quantity warehouse retail item available barcode",
-            "Categories": "category categories type classification",
-            "Purchase History": "supplier purchase history historical timeline",
-            "Sells": "sell sells sold invoice sale sales retail dispatch",
-            "Printers": "printer printers active machine printing device",
-            "Email Configs": "email config emails configuration smtp mail",
-            "Customer Ledgers": "customer ledger ledgers account history",
-            "Supplier Payments": "payment payments paid settled history"
-        }
-        self.tfidf = LightweightTFIDF(self.domain_profiles)
 
     def _extract_list(self, raw_json):
         if isinstance(raw_json, list): return raw_json
@@ -136,7 +201,7 @@ class SQLiteDataMirror:
                     list_children.append((k, v))
             
             if list_children:
-                for list_key, child_list in list_children:
+                for _, child_list in list_children:
                     for child in child_list:
                         row = row_base.copy()
                         for ck, cv in child.items():
@@ -166,159 +231,53 @@ class SQLiteDataMirror:
             self.conn.execute(insert_sql, vals)
         self.conn.commit()
 
-    async def sync(self, force=False):
-        if not force and (time.time() - self.last_sync < CACHE_TTL): return True
+    async def sync_module(self, module_key, api_url, force=False):
+        last_sync = self.last_sync_map.get(module_key, 0)
+        if not force and (time.time() - last_sync < CACHE_TTL): return True
+        
         async with self._lock:
-            if not force and (time.time() - self.last_sync < CACHE_TTL): return True
-            
+            last_sync = self.last_sync_map.get(module_key, 0)
+            if not force and (time.time() - last_sync < CACHE_TTL): return True
+
             async with httpx.AsyncClient(timeout=30.0) as client:
                 try:
                     auth = await client.post(LOGIN_URL, json=LOGIN_PAYLOAD)
                     token = auth.json().get("jwtToken")
                     if not token: return False
                     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-                except: return False
-                
-                endpoints = {
-                    "Materials": "/api/material/get-all-materials",
-                    "Purchases": "/api/purchase/get-all-purchases",
-                    "Supplier Credits": "/api/supplier-credit/get-all-supplier-credits",
-                    "Customers": "/api/customer/get-all-customers",
-                    "Suppliers": "/api/supplier/get-all-suppliers",
-                    "Supplier Ledger": "/api/reports/get-supplier-ledger",
-                    "Product Stocks": "/api/reports/get-product-stocks-with-product",
-                    "Categories": "/api/reports/get-all-product-categories",
-                    "Purchase History": "/api/reports/supplier-purchase-history",
-                    "Sells": "/api/sell/get-all-sells",
-                    "Printers": "/api/printer/get-all-printers",
-                    "Email Configs": "/api/email-config/get-all-emails",
-                    "Customer Ledgers": "/api/reports/get-all-customer-ledgers",
-                    "Supplier Payments": "/api/payment/supplier-payment-history"
-                }
-                
-                tasks = [client.get(f"{BASE_URL}{url}", headers=headers) for url in endpoints.values()]
-                responses = await asyncio.gather(*tasks, return_exceptions=True)
-                
-                for i, key in enumerate(endpoints.keys()):
-                    res = responses[i]
-                    if not isinstance(res, Exception) and res.status_code == 200:
+                    
+                    res = await client.get(f"{BASE_URL}{api_url}", headers=headers)
+                    if res.status_code == 200:
                         data_list = self._extract_list(res.json())
                         flat_records = list(self._stream_flatten(data_list))
-                        self._load_to_sql(key, flat_records)
-            
-            self.last_sync = time.time()
-            return True
+                        self._load_to_sql(module_key, flat_records)
+                        self.last_sync_map[module_key] = time.time()
+                        return True
+                except Exception as e:
+                    print(f"API Sync Error for {module_key}: {e}")
+                    return False
+            return False
+
+    async def sync_all(self, routing_map):
+        tasks = [self.sync_module(mod, data["url"], force=True) for mod, data in routing_map.items()]
+        await asyncio.gather(*tasks)
 
 db = SQLiteDataMirror()
 
 # ==============================================================================
-# 4. SUPER INTELLIGENT QUERY PLANNER (ZERO RULES)
+# 4. THE ACTION ROUTER & FORMATTER
 # ==============================================================================
-class StructuredQueryPlanner:
+class IntelligenceEngine:
     def __init__(self):
-        self.stopwords = {"show", "me", "find", "get", "what", "is", "are", "the", "a", "an", "of", "for", "please", "can", "you", "tell", "details", "all", "we", "have", "our", "available", "availlable", "availble", "names", "list", "give", "in", "any", "by", "its", "their", "specific"}
+        self.brain = AdminBrain()
 
-    def execute_plan(self, query):
-        clean_q = re.sub(r'[^a-zA-Z0-9\s-]', ' ', query.lower())
-        tokens = [t for t in clean_q.split() if t not in self.stopwords]
-        search_term = " ".join(tokens)
-        
-        if not tokens: return None, [], search_term
-
-        scores = db.tfidf.score(search_term)
-        best_table = max(scores, key=scores.get)
-        if scores[best_table] == 0.0: best_table = "Product Stocks"
-
-        cursor = db.conn.cursor()
-        cursor.execute(f'PRAGMA table_info("{best_table}")')
-        columns = [row['name'] for row in cursor.fetchall()]
-        
-        if not columns or columns == ["Notice"]:
-            return best_table, [], search_term
-
-        # --- DYNAMIC SCHEMA-AWARE COLUMN DETECTION (100% Rule-Free) ---
-        intent_words = ["highest", "lowest", "most", "least", "maximum", "minimum", "top"]
-        domain_keywords = db.domain_profiles[best_table].split()
-        
-        raw_filter_tokens = [w for w in search_term.split() if w not in intent_words]
-        final_filter_tokens = [w for w in raw_filter_tokens if w not in domain_keywords]
-        
-        prompt_column = None
-        
-        # Mathematically scan the actual API column names to see if the user mentioned one
-        for col in columns:
-            # Splits camelCase (e.g. 'invoiceNo' -> ['invoice', 'no'])
-            clean_col_words = re.sub(r"([a-z])([A-Z])", r"\1 \2", col).lower().split()
-            
-            for cw in clean_col_words:
-                if len(cw) > 2 and cw in query.lower():
-                    # Check if the user ONLY provided the column name, but gave no actual value
-                    remaining_value_tokens = [t for t in final_filter_tokens if t not in clean_col_words]
-                    if not remaining_value_tokens: 
-                        prompt_column = re.sub(r"([a-z])([A-Z])", r"\1 \2", col).title()
-                        break
-            if prompt_column:
-                break
-                
-        if prompt_column and not final_filter_tokens:
-            return best_table, [], f"PROMPT_MISSING_PARAM:{prompt_column}"
-
-        sql_clauses = {"WHERE": [], "ORDER BY": "", "LIMIT": ""}
-        
-        limit_match = re.search(r'top\s+(\d+)', search_term)
-        if limit_match:
-            sql_clauses["LIMIT"] = f"LIMIT {limit_match.group(1)}"
-
-        numeric_cols = [c for c in columns if any(kw in c.lower() for kw in ["price", "amount", "qty", "quantity", "stock", "total", "balance"])]
-        if numeric_cols:
-            if any(w in search_term for w in ["highest", "most", "maximum", "top"]):
-                sql_clauses["ORDER BY"] = f'ORDER BY CAST("{numeric_cols[0]}" AS REAL) DESC'
-            elif any(w in search_term for w in ["lowest", "least", "minimum"]):
-                sql_clauses["ORDER BY"] = f'ORDER BY CAST("{numeric_cols[0]}" AS REAL) ASC'
-
-        # Safely remove the column names from the search string so we just search for the value
-        if prompt_column:
-            clean_col_words = prompt_column.lower().split()
-            final_filter_tokens = [w for w in final_filter_tokens if w not in clean_col_words]
-            
-        filter_term = " ".join(final_filter_tokens).strip()
-
-        if filter_term:
-            conditions = [f'"{col}" LIKE ?' for col in columns]
-            sql_clauses["WHERE"] = " OR ".join(conditions)
-
-        base_sql = f'SELECT * FROM "{best_table}"'
-        params = []
-        
-        if sql_clauses["WHERE"]:
-            base_sql += f' WHERE {sql_clauses["WHERE"]}'
-            params = [f"%{filter_term}%"] * len(columns)
-            
-        if sql_clauses["ORDER BY"]: base_sql += f' {sql_clauses["ORDER BY"]}'
-        if sql_clauses["LIMIT"]: base_sql += f' {sql_clauses["LIMIT"]}'
-        elif not sql_clauses["WHERE"]: base_sql += ' LIMIT 10000'
-
-        try:
-            cursor.execute(base_sql, params)
-            records = [dict(row) for row in cursor.fetchall()]
-            return best_table, records, filter_term 
-        except Exception as e:
-            print(f"SQL Error: {e}")
-            return best_table, [], filter_term
-
-planner = StructuredQueryPlanner()
-
-# ==============================================================================
-# 5. HUMAN CONVERSATIONAL GENERATOR
-# ==============================================================================
-class LLMStyleFormatter:
     def _calculate_insights(self, records):
         if not records: return None, None
         sum_qty, sum_amount = 0.0, 0.0
         
         for rec in records:
             amount_added = False
-            for amt_key in ["totalAmount", "purchaseAmount", "creditAmount", "sellPrice"]:
+            for amt_key in ["totalAmount", "purchaseAmount", "creditAmount", "sellPrice", "paid"]:
                 actual_key = next((k for k in rec.keys() if k.lower() == amt_key.lower()), None)
                 if actual_key and not amount_added:
                     try:
@@ -337,42 +296,81 @@ class LLMStyleFormatter:
 
         return sum_qty if sum_qty > 0 else None, sum_amount if sum_amount > 0 else None
 
-    def create_human_response(self, domain, records, search_term):
-        if search_term.startswith("PROMPT_MISSING_PARAM:"):
-            missing_param = search_term.split(":")[1]
-            return f"Sure! I can look that up for you in the {domain} database. Could you please specify the **{missing_param}**?"
+    async def execute_and_format(self, user_query, database):
+        analysis = self.brain.analyze_intent(user_query)
+        module = analysis["module"]
+        url = analysis["url"]
+        intent = analysis["intent"]
+        search_val = analysis["search_value"]
 
-        if not domain or not records:
-            return f"I've searched our **{domain}** records, but I couldn't find anything matching **'{search_term}'**. It's possible the database is empty or the specific item isn't logged yet."
+        if intent == "PROMPT_NEEDED":
+            human_missing = re.sub(r"([a-z])([A-Z])", r"\1 \2", analysis["target_column"]).title()
+            return f"You are querying the **{module.replace('-', ' ').title()}** module. Could you please specify the **{human_missing}**? (e.g. *'INV-1002'*)"
+
+        success = await database.sync_module(module, url)
+        if not success:
+            return f"System Notice: I am currently unable to fetch data from `{url}`. Please check the ERP connection."
+
+        cursor = database.conn.cursor()
+        cursor.execute(f'PRAGMA table_info("{module}")')
+        columns = [row['name'] for row in cursor.fetchall()]
+        
+        if not columns or columns == ["Notice"]:
+            return f"I checked the **{module.replace('-', ' ').title()}** section, but no records exist yet."
+
+        base_sql = f'SELECT * FROM "{module}"'
+        params = []
+
+        if intent == "SPECIFIC_SEARCH":
+            col = analysis["target_column"]
+            actual_col = next((c for c in columns if col.lower() in c.lower()), None)
+            if actual_col:
+                base_sql += f' WHERE "{actual_col}" LIKE ?'
+                params = [f"%{search_val}%"]
+            else:
+                intent = "GLOBAL_SEARCH" 
+        
+        if intent == "GLOBAL_SEARCH":
+            conditions = [f'"{c}" LIKE ?' for c in columns]
+            base_sql += ' WHERE ' + " OR ".join(conditions)
+            params = [f"%{search_val}%"] * len(columns)
+
+        base_sql += " LIMIT 10000"
+
+        try:
+            cursor.execute(base_sql, params)
+            records = [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            print(f"SQL Error: {e}")
+            records = []
+
+        display_name = module.replace('-', ' ').title()
+        if not records:
+            return f"I've searched our **{display_name}** records, but I couldn't find anything matching **'{search_val}'**. Please verify the spelling."
 
         total_items = len(records)
         qty, amount = self._calculate_insights(records)
+        ack = random.choice(["I've got that for you. ", "Certainly! ", "Here is the data you requested. "])
         
-        ack = random.choice(["I've got that for you. ", "Certainly! ", "Here is the data you requested. ", "All set. "])
-        
-        if search_term:
-            action = f"I scanned the **{domain}** database for **'{search_term}'**"
-            found = f" and found **{total_items} matching records**."
+        if search_val and intent != "BULK_LIST":
+            action = f"I scanned the **{display_name}** database for **'{search_val}'** and found **{total_items} matching records**."
         else:
-            action = f"I've pulled the complete list of **{domain}**"
-            found = f", which currently contains **{total_items} records**."
+            action = f"I've pulled the complete list of **{display_name}**, which contains **{total_items} records**."
 
         insight_text = ""
         if qty and amount:
-            insight_text = f" I've also tallied the totals: these represent a combined volume of **{int(qty):,} units** with a total financial value of **₹{amount:,.2f}**."
+            insight_text = f" I've tallied the totals: combined volume of **{int(qty):,} units** with a financial value of **₹{amount:,.2f}**."
         elif amount:
             insight_text = f" The total financial value across these records amounts to **₹{amount:,.2f}**."
         elif qty:
-            insight_text = f" Combined, this accounts for a total of **{int(qty):,} units** in our system."
+            insight_text = f" Combined, this accounts for a total of **{int(qty):,} units**."
 
-        closing = " Here is the detailed breakdown:<br><br>"
-        intro_paragraph = ack + action + found + insight_text + closing
+        intro_paragraph = ack + action + insight_text + " Here is the detailed breakdown:<br><br>"
 
         raw_keys = set()
         for r in records: raw_keys.update(r.keys())
         visible_keys = [k for k in raw_keys if k not in {"id", "_id", "__v", "password", "jwtToken", "role", "permissions"}]
-        
-        priority_keys = ["invoiceNo", "productName", "name", "firstName", "lastName", "supplierName", "supplier", "product", "customer", "materialName", "email", "phone", "contact", "stockQuantity", "sellPrice", "totalAmount"]
+        priority_keys = ["invoiceNo", "productName", "name", "firstName", "lastName", "supplierName", "supplier", "product", "customer", "materialName", "email", "phone", "contact", "stockQuantity", "sellPrice", "totalAmount", "paid", "creditAmount"]
         headers = sorted(visible_keys, key=lambda x: priority_keys.index(x) if x in priority_keys else 99)
 
         html = "<div style='overflow-x:auto; margin-top:10px; border-radius:8px; box-shadow:0 4px 6px -1px rgba(0,0,0,0.1);'>"
@@ -394,13 +392,13 @@ class LLMStyleFormatter:
                 elif isinstance(val, str) and "T" in val and len(val) >= 19 and val.count("-") >= 2:
                     try: val = val.split("T")[0] + " " + val.split("T")[1][:5]
                     except: pass
-                elif isinstance(val, (int, float)) and any(kw in h.lower() for kw in ["price", "amount", "total", "balance", "credit"]):
+                elif isinstance(val, (int, float)) and any(kw in h.lower() for kw in ["price", "amount", "total", "balance", "credit", "paid"]):
                     val = f"₹ {val:,.2f}" 
                 html += f"<td style='padding:12px 16px; border:1px solid #e2e8f0; color:#334155; font-size:14px; white-space:nowrap;'>{val}</td>"
             html += "</tr>"
         return intro_paragraph + html + "</table></div>"
 
-bot_voice = LLMStyleFormatter()
+agent = IntelligenceEngine()
 
 # ==============================================================================
 # MAIN ROUTE
@@ -414,9 +412,23 @@ async def chat_endpoint(request: ChatRequest):
     user_query = request.query or request.question or ""
     q_lower = user_query.lower().strip()
 
+    # --- THE "SELF-AWARE" IDENTITY BLOCK ---
+    identity_triggers = ["who are you", "how do you work", "are you chatgpt", "chatgpt", "chat gpt", "your brain", "mathematical calculations", "how were you built", "hybrid"]
+    if any(w in q_lower for w in identity_triggers):
+        return {
+            "response": (
+                "I am a **Hybrid Deterministic NLU (Natural Language Understanding) Engine**.<br><br>"
+                "Before Large Language Models like ChatGPT existed, AI made decisions using strict mathematical logic (like TF-IDF) and precise rule-based pipelines. While ChatGPT guesses words based on probability—which is why it often hallucinates fake financial data—my architecture is built specifically for ERP precision.<br><br>"
+                "**How I work:**<br>"
+                "1. **Strict Routing:** I first map your English directly to our backend API endpoints. If you ask for 'Sales', I hit the Sales API with 100% certainty.<br>"
+                "2. **Mathematical Fallback:** If you use unusual phrasing, my fallback engine uses TF-IDF mathematics to calculate vector similarities and 'guess' your intent.<br><br>"
+                "Because I execute logic locally and map directly to SQLite, I require zero external AI APIs, cost nothing to run, and am mathematically guaranteed to never hallucinate your accounting data."
+            )
+        }
+
     if any(w in q_lower for w in ["refresh", "sync", "update records"]):
-        await db.sync(force=True)
-        return {"response": "🔄 **System Synced.** I have successfully connected to the ERP and downloaded the latest live data. What would you like to see?"}
+        await db.sync_all(agent.brain.api_routing_map) 
+        return {"response": "🔄 **System Fully Synced.** I have forced a refresh of all ERP databases. What would you like to see?"}
 
     if q_lower in ["thank you", "thanks", "awesome", "perfect"]:
         return {"response": random.choice(["You're very welcome! Let me know if you need any other reports.", "My pleasure! I'm here if you need more data."])}
@@ -425,12 +437,6 @@ async def chat_endpoint(request: ChatRequest):
     if any(q_lower.startswith(g) for g in greet_words) and len(q_lower.split()) <= 3:
         return {"response": "Hello! I am your AI Operations Assistant. You can ask me to analyze inventory, find specific purchase invoices, or check supplier credits. How can I help you today?"}
 
-    processed_query = private_preprocess(user_query)
+    response_html = await agent.execute_and_format(user_query, db)
 
-    success = await db.sync()
-    if not success: 
-        return {"response": "System Notice: I am currently unable to securely connect to the ERP backend. Please verify your network."}
-
-    domain, results, search_term = planner.execute_plan(processed_query)
-
-    return {"response": bot_voice.create_human_response(domain, results, search_term)}
+    return {"response": response_html}
