@@ -4,12 +4,48 @@
   ERP Chatbot RAG Pipeline · Zero external AI APIs · <120 MB RAM
   Full Marathi (Devanagari + Roman) + English support
 
+ARCHITECTURE
+┌──────────────────────────────────────────────────────────────────┐
+│  User Query (English / मराठी / Marathi Roman typing)             │
+│      │                                                           │
+│      ▼                                                           │
+│  LanguageDetector ──► MarathiClassifier (if Marathi detected)   │
+│      │                        │                                  │
+│      │ (English)              │ (Marathi)                        │
+│      ▼                        ▼                                  │
+│  IntentClassifier      MarathiIntentMap                          │
+│  (5-stage NLU)               │                                   │
+│      │                        │                                  │
+│      └──────────┬─────────────┘                                  │
+│                 ▼                                                 │
+│          Multi-API Planner ──► Async Fetch Pool                  │
+│                 │                      │                          │
+│                 ▼                      ▼                          │
+│           SQLite FTS5 Mirror    DataMirror Cache                  │
+│                 │                                                 │
+│                 ▼                                                 │
+│          RAG Retriever ──► ResponseSynthesizer                   │
+│                                    │                             │
+│                                    ▼                             │
+│          HTML Response (English or मराठी based on input)         │
+└──────────────────────────────────────────────────────────────────┘
+
+  KEY INNOVATIONS vs v3/v4:
+  1. Language detection — Devanagari Unicode + Roman phonetic markers
+  2. Marathi intent map — 206 keywords across Devanagari + Roman
+  3. Marathi response synthesizer — headers, summaries, UI in Marathi
+  4. Marathi column translations — all 40+ ERP column headers translated
+  5. Longest-match algorithm — most specific Marathi phrase wins
+  6. Mixed-language queries — "supplier credit kiti ahe" works perfectly
+  7. Language-aware QueryParser — correct stop set per language
+  8. Devanagari inflection stemming — उत्पादने→उत्पादन, साथ→साठा, etc.
+
   BUGS FIXED vs v4:
   ─────────────────
   1. Marathi stop words — 120+ words so filler phrases like "kiti ahe",
      "dya", "sarv", "dakha", "mala", "chi", "yadi" never leak into search_value
   2. Marathi bulk triggers — sarv/saglya/yadi correctly set BULK_LIST intent
-  3. Devanagari inflection stems — उत्पादने→उत्पादन, साथ→साठा, etc.
+  3. Devanagari inflection stems — उत्पादने→उत्पादन, साठाची→साठा, etc.
   4. QueryParser is now language-aware — passes correct stop set per language
   5. Price Code / Barcode / HSN columns no longer formatted as currency
   6. API retry with exponential backoff — 3 attempts before showing error
@@ -44,16 +80,24 @@ LOGIN_CREDS = {
     "username": os.getenv("ERP_USERNAME", "superadmin.com"),
     "password": os.getenv("ERP_PASSWORD",  "superadmin@123"),
 }
-MODULE_TTL       = 300      # 5 min — master data
-STOCK_TTL        = 120      # 2 min — inventory
-FINANCE_TTL      = 600      # 10 min — ledgers / finance
-MAX_ROWS         = 50_000   # per-module SQLite cap
+MODULE_TTL       = 300      # 5 min — master data (customers, suppliers, etc.)
+STOCK_TTL        = 120      # 2 min — inventory (changes frequently)
+FINANCE_TTL      = 600      # 10 min — ledgers / finance (slower moving)
+MAX_ROWS         = 50_000   # per-module SQLite cap (prevents RAM explosion)
 API_TIMEOUT      = 30.0
-API_MAX_RETRIES  = 3
+API_MAX_RETRIES  = 3        # exponential backoff: 1.5s, 3s, 6s
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # MODULE REGISTRY
+# Each module defines:
+#   url         - API endpoint (relative to BASE_URL)
+#   ttl         - cache lifetime in seconds
+#   keywords    - high-confidence single-word matches for NLU stage 3
+#   phrases     - multi-word matches (checked FIRST at stage 2, highest priority)
+#   aliases     - typo/synonym list for fuzzy matching at stage 4
+#   amount_cols - columns holding monetary values (for aggregation + formatting)
+#   qty_cols    - columns holding quantities (for aggregation + formatting)
 # ──────────────────────────────────────────────────────────────────────────────
 MODULE_REGISTRY = {
     "supplier-credit": {
@@ -189,7 +233,12 @@ MODULE_REGISTRY = {
     },
 }
 
-# Multi-module compound queries
+# ──────────────────────────────────────────────────────────────────────────────
+# MULTI-MODULE QUERY PATTERNS
+# When a query involves more than one module, define it here.
+# Key: display label.  Value: list of module keys to fetch simultaneously.
+# All listed modules are fetched concurrently via asyncio.gather().
+# ──────────────────────────────────────────────────────────────────────────────
 MULTI_PATTERNS = [
     {
         "phrases": ["supplier summary", "supplier overview", "vendor summary",
@@ -220,7 +269,12 @@ MULTI_PATTERNS = [
     },
 ]
 
-# Column search triggers
+# ──────────────────────────────────────────────────────────────────────────────
+# COLUMN SEARCH TRIGGERS
+# Maps natural language words → likely column names to target.
+# Used by QueryParser to detect COLUMN_SEARCH intent and extract target_col.
+# First item in each list is the primary column candidate.
+# ──────────────────────────────────────────────────────────────────────────────
 COLUMN_TRIGGERS = {
     "invoice": ["invoiceNo", "invoice"],
     "bill":    ["invoiceNo", "billNo"],
@@ -239,6 +293,12 @@ COLUMN_TRIGGERS = {
     "price":   ["sellPrice", "price", "pricePerUnit"],
     "status":  ["status", "supplyType"],
 }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# STOP WORD SETS
+# Three sets are used depending on detected language.
+# Stop words are stripped before extracting search_value in QueryParser.
+# ──────────────────────────────────────────────────────────────────────────────
 
 # ── English stop words ────────────────────────────────────────────────────────
 EN_STOP = {
@@ -260,12 +320,14 @@ EN_BULK = {
     "display", "give", "complete", "full",
 }
 
-# ── Marathi stop words (Roman) ────────────────────────────────────────────────
+# ── Marathi stop words (Roman transliteration) ────────────────────────────────
+# These are stripped so filler phrases like "mala dakhva", "sarv yadi",
+# "kiti ahe" never leak into the search_value. 120+ entries.
 MR_STOP_ROMAN = {
     # Pronouns
     "mala", "mla", "mhala", "amhala", "amhi", "mi", "tu", "to", "ti",
     "te", "tyala", "tila", "aapan", "apan",
-    # Show/give/display commands
+    # Show/give/display commands — never a search value
     "dakhva", "dakhav", "dakhvav", "dakha", "dakhava", "dakhvaa",
     "dikhao", "dikhav", "dikhava", "dikhva",
     "dya", "deu", "de", "dyaa", "dyave",
@@ -274,7 +336,7 @@ MR_STOP_ROMAN = {
     "kadhav", "kadhva", "milvava", "milva", "milu", "mil",
     "ghya", "ghyava", "aana", "aanava",
     "pahije", "hve", "have",
-    # List/all
+    # List/all — set BULK intent, never search value
     "sarv", "sarva", "saglya", "sagale", "sagala", "sagali", "sagle",
     "yadi", "yaadi", "soochi", "suchi", "jadval",
     "sampurn", "sampoorna", "poorna", "purna",
@@ -303,13 +365,14 @@ MR_STOP_ROMAN = {
 }
 
 # ── Marathi bulk trigger words (Roman) ───────────────────────────────────────
+# When any of these appear in a query, intent is forced to BULK_LIST
 MR_BULK_ROMAN = {
     "sarv", "sarva", "saglya", "sagale", "yadi", "yaadi",
     "sare", "sara", "sampurn", "poorna", "purna", "soochi",
     "all", "every", "complete", "full", "entire", "sarav",
 }
 
-# ── Marathi stop words (Devanagari) ──────────────────────────────────────────
+# ── Marathi stop words (Devanagari script) ────────────────────────────────────
 MR_STOP_DEVA = {
     "मला", "म्हाला", "आम्हाला", "आम्ही", "मी", "तू", "तो", "ती", "ते",
     "त्याला", "तिला", "आपण",
@@ -342,7 +405,24 @@ MR_BULK_DEVA = {
     "सर्व", "सगळ्या", "सगळे", "यादी", "सूची", "संपूर्ण", "पूर्ण", "सारे",
 }
 
+# ──────────────────────────────────────────────────────────────────────────────
+# MARATHI LANGUAGE LAYER
+# Covers three input modes:
+#   1. Devanagari script  — e.g. "सर्व खरेदी दाखवा"
+#   2. Roman transliteration (Marathi typing) — e.g. "kharedi list dya"
+#   3. Mixed — e.g. "supplier credit kiti ahe"
+#
+# Design principles:
+#   - Longest-match wins (more specific phrase beats shorter keyword)
+#   - Devanagari detection via Unicode range U+0900–U+097F
+#   - Roman detection via a curated frozenset of Marathi phonetic markers
+#   - Devanagari inflection stemming applied before classification
+#   - All detection is O(n*m) — fast enough for real-time use
+# ──────────────────────────────────────────────────────────────────────────────
+
 # ── Devanagari inflection → canonical form ────────────────────────────────────
+# Maps common inflected forms to their base/canonical form so the intent map
+# can match correctly. e.g. "उत्पादने दाखवा" → "उत्पादन दाखवा" → product-stock
 DEVA_STEMS = {
     "उत्पादने":       "उत्पादन",
     "उत्पादनें":      "उत्पादन",
@@ -368,10 +448,9 @@ DEVA_STEMS = {
     "विक्रीचे":       "विक्री",
 }
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# MARATHI INTENT MAP  (keyword → module, sorted longest-first)
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Intent keyword map — Devanagari + Roman per module ────────────────────────
+# Sorted by length descending at runtime so longest match wins.
+# e.g. "पुरवठादार क्रेडिट" (18 chars) beats "क्रेडिट" (7 chars)
 _MR_RAW = {
     "purchase": {
         "deva": [
@@ -508,14 +587,16 @@ _MR_RAW = {
     },
 }
 
-# Pre-sort flat list: longest keyword wins
+# Pre-sort flat list longest-first so longest keyword always wins
 _MR_FLAT: list = []
 for _mod, _kws in _MR_RAW.items():
     for k in _kws["deva"] + _kws["roman"]:
         _MR_FLAT.append((k.lower(), _mod))
 _MR_FLAT.sort(key=lambda x: len(x[0]), reverse=True)
 
-# ── Marathi phonetic markers for language detection ───────────────────────────
+# ── Marathi Roman phonetic markers (used for language detection) ──────────────
+# A query containing ANY of these is classified as 'marathi_roman'.
+# Carefully chosen to have low false-positive rate with English.
 _MR_ROMAN_MARKERS: frozenset = frozenset([
     "kharedi", "kharedee", "kharidi", "vikri", "vikree",
     "grahak", "graahak", "purvathakaar", "puravathakaar",
@@ -530,7 +611,7 @@ _MR_ROMAN_MARKERS: frozenset = frozenset([
     "dakhva", "dakhav", "dakha", "mala", "mhala",
 ])
 
-# ── Marathi greetings / thanks ────────────────────────────────────────────────
+# ── Marathi quick-response word sets ─────────────────────────────────────────
 _MR_GREET: frozenset = frozenset([
     "नमस्कार", "नमस्ते", "हॅलो", "सुप्रभात",
     "namaskar", "namaste", "namasте",
@@ -543,8 +624,7 @@ _MR_REFRESH: frozenset = frozenset([
     "रिफ्रेश", "अद्यतन", "ताजी", "refresh kara", "update kara", "sync kara",
 ])
 
-
-# ── Marathi translations ──────────────────────────────────────────────────────
+# ── Column header translations ────────────────────────────────────────────────
 MR_COLUMNS = {
     "Invoice No":      "इनव्हॉइस क्र.",
     "Name":            "नाव",
@@ -601,6 +681,7 @@ MR_COLUMNS = {
     "Debit Amount":    "नावे रक्कम",
 }
 
+# ── Module name translations ──────────────────────────────────────────────────
 MR_MODULES = {
     "purchase":        "खरेदी",
     "sell":            "विक्री",
@@ -623,6 +704,16 @@ MR_MODULES = {
 # ──────────────────────────────────────────────────────────────────────────────
 
 def detect_language(text: str) -> str:
+    """
+    Returns: 'marathi_devanagari' | 'marathi_roman' | 'english'
+
+    Algorithm:
+      1. Count Devanagari chars (U+0900–U+097F). If >25% of alpha chars → Devanagari.
+      2. Else check for any Marathi Roman phonetic markers → marathi_roman.
+      3. Else → english.
+
+    Fast: O(len(text)) for step 1, O(markers) for step 2.
+    """
     deva  = sum(1 for c in text if 0x0900 <= ord(c) <= 0x097F)
     alpha = sum(1 for c in text if c.isalpha())
     if alpha == 0:
@@ -636,11 +727,18 @@ def detect_language(text: str) -> str:
 
 
 def marathi_classify(text: str) -> Optional[str]:
-    """Longest-match: returns module key or None."""
-    # Apply Devanagari stemming first
-    words = text.split()
+    """
+    Classify a Marathi query (Devanagari or Roman) to a module key.
+
+    Uses longest-match: 'purvathakaar credit' (18 chars) beats 'credit' (6 chars).
+    Applies Devanagari inflection stemming before matching.
+
+    Returns module key string or None if no match found.
+    """
+    # Normalise inflected forms first
+    words   = text.split()
     stemmed = " ".join(DEVA_STEMS.get(w, w) for w in words)
-    t = stemmed.lower().strip()
+    t       = stemmed.lower().strip()
     for keyword, module in _MR_FLAT:
         if keyword in t:
             return module
@@ -648,36 +746,59 @@ def marathi_classify(text: str) -> Optional[str]:
 
 
 def _apply_deva_stems(text: str) -> str:
+    """Apply Devanagari inflection stemming to all words in text."""
     return " ".join(DEVA_STEMS.get(w, w) for w in text.split())
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# NLU — 5-STAGE ENGLISH INTENT CLASSIFIER
+# 1. NLU — 5-STAGE ENGLISH INTENT CLASSIFIER
+#
+# Pipeline with confidence scoring:
+#   S1: Multi-module patterns     → confidence 1.0
+#   S2: Phrase match              → confidence 0.95  (longest phrase wins)
+#   S3: Keyword match (scored)    → confidence proportional to match density
+#   S4: Fuzzy alias match         → confidence = fuzzy_ratio × 0.85
+#   S5: TF-IDF cosine fallback    → confidence = cosine_score × 0.75
+#
+# The highest-confidence match across all 5 stages wins.
+# Below 0.12 confidence → UNRECOGNIZED (asks for clarification).
 # ──────────────────────────────────────────────────────────────────────────────
 
 class IntentClassifier:
     def __init__(self):
         self._build_tfidf()
-        self._phrase_pairs = [
-            (ph.lower(), mod)
-            for mod, d in MODULE_REGISTRY.items()
-            for ph in d["phrases"]
-        ]
+        # Flat phrase pairs sorted longest-first so most specific phrase wins
+        self._phrase_pairs = sorted(
+            [
+                (ph.lower(), mod)
+                for mod, d in MODULE_REGISTRY.items()
+                for ph in d["phrases"]
+            ],
+            key=lambda x: len(x[0]),
+            reverse=True,
+        )
         self._alias_pairs = [
             (al.lower(), mod)
             for mod, d in MODULE_REGISTRY.items()
             for al in d["aliases"]
         ]
-        self._multi_pairs = [
-            (ph.lower(), pat)
-            for pat in MULTI_PATTERNS
-            for ph in pat["phrases"]
-        ]
-        # Sort phrase pairs by length so longest matches win
-        self._phrase_pairs.sort(key=lambda x: len(x[0]), reverse=True)
-        self._multi_pairs.sort(key=lambda x:  len(x[0]), reverse=True)
+        # Multi-module phrase pairs sorted longest-first
+        self._multi_pairs = sorted(
+            [
+                (ph.lower(), pat)
+                for pat in MULTI_PATTERNS
+                for ph in pat["phrases"]
+            ],
+            key=lambda x: len(x[0]),
+            reverse=True,
+        )
 
     def _build_tfidf(self):
+        """
+        Build TF-IDF vectors for each module's keyword corpus.
+        IDF = log((1+N)/(1+df)) + 1  (sklearn-style smoothing)
+        Vectors are L2-normalised so cosine similarity = dot product.
+        """
         corpus = {mod: " ".join(d["keywords"]) for mod, d in MODULE_REGISTRY.items()}
         N = len(corpus)
         vocab: set = set()
@@ -693,19 +814,20 @@ class IntentClassifier:
             if not words:
                 self._vecs[mod] = {}
                 continue
-            tf = Counter(words)
-            raw = {w: (tf[w] / len(words)) * idf.get(w, 0) for w in tf}
+            tf   = Counter(words)
+            raw  = {w: (tf[w] / len(words)) * idf.get(w, 0) for w in tf}
             norm = math.sqrt(sum(v**2 for v in raw.values()))
             self._vecs[mod] = {w: v / norm for w, v in raw.items()} if norm else {}
 
-    def _tfidf(self, text: str) -> dict:
+    def _tfidf_score(self, text: str) -> dict:
+        """Return {module: cosine_score} for a cleaned query string."""
         words = text.split()
         if not words:
             return {}
-        tf = Counter(words)
-        n = len(words)
-        q = {w: tf[w] / n for w in tf}
-        qn = math.sqrt(sum(v**2 for v in q.values()))
+        tf  = Counter(words)
+        n   = len(words)
+        q   = {w: tf[w] / n for w in tf}
+        qn  = math.sqrt(sum(v**2 for v in q.values()))
         if not qn:
             return {}
         scores = {}
@@ -714,35 +836,39 @@ class IntentClassifier:
             scores[mod] = sum(q[w] * dv[w] for w in common) / qn
         return scores
 
-    def classify(self, text: str) -> dict:
-        t = re.sub(r"[^a-z0-9\s\-]", " ", text.lower()).strip()
-        tokens = t.split()
-
-        # S1 multi
+    # ── Stage 1: Multi-module ───────────────────────────────────────────────
+    def _stage_multi(self, text: str):
         for ph, pat in self._multi_pairs:
-            if ph in t:
+            if ph in text:
                 return {"type": "MULTI", "pattern": pat, "confidence": 1.0}
+        return None
 
-        # S2 phrase
+    # ── Stage 2: Phrase match ───────────────────────────────────────────────
+    def _stage_phrase(self, text: str):
         for ph, mod in self._phrase_pairs:
-            if ph in t:
+            if ph in text:
                 return {"type": "SINGLE", "module": mod, "confidence": 0.95}
+        return None
 
-        # S3 keyword count
+    # ── Stage 3: Keyword count scoring ─────────────────────────────────────
+    def _stage_keyword(self, text: str):
         best_mod, best_cnt = None, 0
         for mod, d in MODULE_REGISTRY.items():
             cnt = sum(1 for kw in d["keywords"]
-                      if re.search(rf"\b{re.escape(kw)}\b", t))
+                      if re.search(rf"\b{re.escape(kw)}\b", text))
             if cnt > best_cnt:
                 best_cnt, best_mod = cnt, mod
         if best_cnt:
             return {"type": "SINGLE", "module": best_mod,
                     "confidence": min(0.9, 0.3 + 0.15 * best_cnt)}
+        return None
 
-        # S4 fuzzy alias
+    # ── Stage 4: Fuzzy alias matching ──────────────────────────────────────
+    def _stage_fuzzy(self, tokens: list):
+        """SequenceMatcher ratio — catches typos like 'purchaces' → purchases."""
         best_s, best_mod = 0.0, None
         for tok in tokens:
-            if len(tok) < 4:
+            if len(tok) < 4:  # skip very short tokens
                 continue
             for al, mod in self._alias_pairs:
                 s = SequenceMatcher(None, tok, al).ratio()
@@ -751,20 +877,46 @@ class IntentClassifier:
         if best_s >= 0.72:
             return {"type": "SINGLE", "module": best_mod,
                     "confidence": best_s * 0.85}
+        return None
 
-        # S5 TF-IDF
-        scores = self._tfidf(t)
+    # ── Stage 5: TF-IDF cosine fallback ────────────────────────────────────
+    def _stage_tfidf(self, text: str):
+        scores = self._tfidf_score(text)
         if scores:
             best = max(scores, key=scores.get)
             if scores[best] >= 0.12:
                 return {"type": "SINGLE", "module": best,
                         "confidence": scores[best] * 0.75}
+        return None
 
-        return {"type": "UNRECOGNIZED", "confidence": 0.0}
+    # ── Main classify ────────────────────────────────────────────────────────
+    def classify(self, user_query: str) -> dict:
+        t      = re.sub(r"[^a-z0-9\s\-]", " ", user_query.lower()).strip()
+        tokens = t.split()
+
+        return (
+            self._stage_multi(t)
+            or self._stage_phrase(t)
+            or self._stage_keyword(t)
+            or self._stage_fuzzy(tokens)
+            or self._stage_tfidf(t)
+            or {"type": "UNRECOGNIZED", "confidence": 0.0}
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# QUERY PARSER  — language-aware stop word stripping
+# 2. QUERY PARSER — language-aware
+#
+# Given a module and the raw user query, determines:
+#   intent:       BULK_LIST | GLOBAL_SEARCH | COLUMN_SEARCH | PROMPT_NEEDED
+#   target_col:   specific column to search in (if detected via COLUMN_TRIGGERS)
+#   search_value: the actual value to search for (after stripping stop words)
+#   aggregation:  SUM | NONE
+#
+# Language awareness:
+#   - English queries use EN_STOP / EN_BULK
+#   - Marathi queries use MR_STOP_ROMAN | MR_STOP_DEVA  and  MR_BULK_*
+#   This prevents Marathi filler words from leaking into search_value.
 # ──────────────────────────────────────────────────────────────────────────────
 
 AGG_TRIGGERS = {
@@ -776,28 +928,33 @@ AGG_TRIGGERS = {
 
 class QueryParser:
     def parse(self, user_query: str, module_key: str, lang: str) -> dict:
+        """
+        Parse user_query in the context of module_key and detected language.
+
+        Returns dict with keys: intent, target_col, search_value, aggregation.
+        """
         text_lower = user_query.lower()
 
-        # Apply Devanagari stemming
+        # Apply Devanagari stemming before any further processing
         if lang == "marathi_devanagari":
             text_lower = _apply_deva_stems(text_lower)
 
         tokens = text_lower.split()
 
-        # Aggregation
+        # ── Aggregation detection ────────────────────────────────────────────
         agg = any(t in text_lower for t in AGG_TRIGGERS)
 
-        # Pick stop set by language
+        # ── Language-specific stop / bulk sets ───────────────────────────────
         if lang in ("marathi_devanagari", "marathi_roman"):
-            stop  = MR_STOP_ROMAN | MR_STOP_DEVA
-            bulk  = MR_BULK_ROMAN | MR_BULK_DEVA
+            stop = MR_STOP_ROMAN | MR_STOP_DEVA
+            bulk = MR_BULK_ROMAN | MR_BULK_DEVA
         else:
-            stop  = EN_STOP
-            bulk  = EN_BULK
+            stop = EN_STOP
+            bulk = EN_BULK
 
         is_bulk = any(tok in bulk for tok in tokens)
 
-        # Module keywords to strip
+        # ── Strip module vocabulary ──────────────────────────────────────────
         mod = MODULE_REGISTRY[module_key]
         mod_words: set = set()
         for kw in mod["keywords"]:
@@ -811,7 +968,7 @@ class QueryParser:
             if m == module_key:
                 mod_words.update(kw.split())
 
-        # Detect target column from English triggers
+        # ── Detect target column ─────────────────────────────────────────────
         target_col = None
         col_words: set = set()
         for trigger, cols in COLUMN_TRIGGERS.items():
@@ -820,14 +977,15 @@ class QueryParser:
                 col_words.update([trigger, trigger + "s", trigger + "es"])
                 break
 
-        # Strip everything
+        # ── Extract search value ─────────────────────────────────────────────
+        # Value tokens = whatever remains after stripping stop + module + col words
         strip = stop | mod_words | col_words
         value_tokens = [
             tok for tok in tokens
             if tok not in strip and len(tok) > 1
         ]
 
-        # Preserve codes and numbers (invoice numbers, barcodes)
+        # Codes and numbers (invoice numbers, barcodes) — preserve regardless
         code_tokens = [
             tok for tok in tokens
             if re.match(r"^[a-z0-9\-]+$", tok)
@@ -839,7 +997,7 @@ class QueryParser:
 
         search_value = " ".join(value_tokens).strip()
 
-        # Determine intent
+        # ── Determine intent ─────────────────────────────────────────────────
         if target_col:
             intent = "COLUMN_SEARCH" if search_value else "PROMPT_NEEDED"
         elif search_value and not is_bulk:
@@ -856,23 +1014,45 @@ class QueryParser:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# DATA MIRROR — SQLite in-memory + FTS5 + retry logic
+# 3. DATA MIRROR — SQLite in-memory with FTS5
+#
+# For each module, maintains TWO tables:
+#   "{module}"       — structured columnar data (typed TEXT columns)
+#   "{module}_fts"   — FTS5 virtual table for full-text BM25 search
+#
+# FTS5 advantages over LIKE:
+#   • BM25 ranking (relevance-sorted results, not just existence)
+#   • Tokenizer handles word boundaries correctly
+#   • 5-10× faster on large datasets
+#   • Case-insensitive by default
+#   • Supports prefix search: MATCH 'INV-*'
+#
+# TTL-based caching:
+#   • Each module has an expiry timestamp
+#   • sync_module() is a no-op if cache is still valid
+#   • sync_all(force=True) bypasses cache (used on "refresh" commands)
+#
+# API resilience:
+#   • 3 retry attempts with exponential backoff (1.5s, 3s, 6s)
+#   • Returns None on all retries failing → api_error shown to user
 # ──────────────────────────────────────────────────────────────────────────────
 
 class DataMirror:
     def __init__(self):
+        # WAL mode allows concurrent reads without blocking writes
         self.conn = sqlite3.connect(":memory:", check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA temp_store=MEMORY")
-        self.conn.execute("PRAGMA cache_size=-16000")
-        self._ttl:     dict = {}
-        self._cols:    dict = {}
+        self.conn.execute("PRAGMA cache_size=-16000")  # 16 MB page cache
+        self._ttl:  dict = {}   # module → expiry timestamp
+        self._cols: dict = {}   # module → list of column names
         self._lock = asyncio.Lock()
 
-    # ── JSON flattening ───────────────────────────────────────────────────────
+    # ── Flatten nested API JSON ─────────────────────────────────────────────
     def _extract_list(self, raw) -> list:
+        """Extract the primary data list from varied API response shapes."""
         if isinstance(raw, list):
             return raw
         if isinstance(raw, dict):
@@ -884,6 +1064,15 @@ class DataMirror:
         return []
 
     def _flatten(self, records: list):
+        """
+        Generator: yields flat dict rows from possibly nested API records.
+
+        Handles:
+          - Primitive values → str()
+          - Nested dicts → extracts best display value (name/title/invoiceNo)
+          - Lists of dicts → cross-joins with parent row (child rows)
+          - None → empty string
+        """
         for rec in records:
             if not isinstance(rec, dict):
                 yield {"_data": str(rec)}
@@ -917,6 +1106,13 @@ class DataMirror:
 
     # ── SQLite load ───────────────────────────────────────────────────────────
     def _load(self, key: str, records: list):
+        """
+        Create/replace columnar table + FTS5 virtual table for a module.
+
+        Uses content= FTS table (no data duplication — FTS index references
+        main table rowid). Tokenizer: unicode61 with diacritics removed
+        (so "Rahül" matches "rahul").
+        """
         cur = self.conn.cursor()
         cur.execute(f'DROP TABLE IF EXISTS "{key}_fts"')
         cur.execute(f'DROP TABLE IF EXISTS "{key}"')
@@ -927,7 +1123,7 @@ class DataMirror:
             self.conn.commit()
             return
 
-        # Collect keys preserving insertion order
+        # Collect all unique column names preserving insertion order
         seen, all_keys = set(), []
         for r in records:
             for k in r:
@@ -940,7 +1136,7 @@ class DataMirror:
         # Columnar table
         cols_ddl = ", ".join(f'"{k}" TEXT' for k in all_keys)
         cur.execute(f'CREATE TABLE "{key}" (_rowid INTEGER PRIMARY KEY, {cols_ddl})')
-        ph = ",".join(["?"] * len(all_keys))
+        ph     = ",".join(["?"] * len(all_keys))
         col_sql = ", ".join(f'"{k}"' for k in all_keys)
         for r in records:
             cur.execute(
@@ -948,7 +1144,7 @@ class DataMirror:
                 [r.get(k, "") for k in all_keys],
             )
 
-        # FTS5 index
+        # FTS5 content table (index only, references main table)
         fts_cols = ", ".join(f'"{k}"' for k in all_keys)
         cur.execute(
             f'CREATE VIRTUAL TABLE "{key}_fts" USING fts5('
@@ -962,13 +1158,18 @@ class DataMirror:
         self.conn.commit()
         self._cols[key] = all_keys
 
-    # ── API fetch with retry ──────────────────────────────────────────────────
+    # ── API fetch with exponential backoff retry ──────────────────────────────
     async def _fetch_with_retry(self, url: str) -> Optional[list]:
+        """
+        Fetch a module's data from the ERP API.
+        Retries up to API_MAX_RETRIES times with exponential backoff.
+        Returns flat record list or None on total failure.
+        """
         last_exc = None
         for attempt in range(API_MAX_RETRIES):
             try:
                 async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
-                    auth = await client.post(LOGIN_URL, json=LOGIN_CREDS)
+                    auth  = await client.post(LOGIN_URL, json=LOGIN_CREDS)
                     token = auth.json().get("jwtToken")
                     if not token:
                         return None
@@ -983,16 +1184,22 @@ class DataMirror:
             except Exception as exc:
                 last_exc = exc
                 if attempt < API_MAX_RETRIES - 1:
-                    await asyncio.sleep(1.5 * (2 ** attempt))
+                    await asyncio.sleep(1.5 * (2 ** attempt))  # 1.5s, 3s, 6s
         print(f"[DataMirror] All retries failed for {url}: {last_exc}")
         return None
 
     # ── Sync single module ────────────────────────────────────────────────────
     async def sync_module(self, key: str, force: bool = False) -> bool:
+        """
+        Sync a module from the ERP API into SQLite.
+        Double-checked locking: check TTL before and after acquiring lock.
+        Returns True on success, False on API failure.
+        """
         now = time.time()
         if not force and now < self._ttl.get(key, 0):
-            return True
+            return True  # cache still valid
         async with self._lock:
+            # Re-check inside lock (another coroutine may have synced first)
             if not force and now < self._ttl.get(key, 0):
                 return True
             mod = MODULE_REGISTRY[key]
@@ -1005,6 +1212,7 @@ class DataMirror:
             return True
 
     async def sync_modules(self, keys: list, force: bool = False) -> dict:
+        """Sync multiple modules concurrently via asyncio.gather()."""
         results = await asyncio.gather(
             *[self.sync_module(k, force) for k in keys],
             return_exceptions=True,
@@ -1025,15 +1233,35 @@ db = DataMirror()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# RAG RETRIEVER — FTS5 BM25 → LIKE fallback → bulk
+# 4. RAG RETRIEVER — FTS5 BM25 → LIKE fallback → bulk
+#
+# Three-tier retrieval strategy per module:
+#
+#   Tier A — FTS5 BM25 search (if search value provided)
+#       Fast, ranked, handles partial words with prefix* matching.
+#       Falls back to Tier B if FTS returns no results.
+#
+#   Tier B — SQLite LIKE scan across all columns
+#       Broad catch-all. Used when FTS misses something (e.g. partial
+#       barcode, numeric codes that FTS tokenises differently).
+#
+#   Tier C — Full table scan (BULK_LIST intent)
+#       Returns all rows up to MAX_BULK. Used for "show all X" queries.
+#
+# All results are returned as list[dict] with original column names.
+# _rowid is stripped from returned dicts (internal SQLite bookkeeping).
 # ──────────────────────────────────────────────────────────────────────────────
 
 class RAGRetriever:
-    MAX_FTS  = 500
-    MAX_LIKE = 500
-    MAX_BULK = 10_000
+    MAX_FTS  = 500     # max rows from FTS pass
+    MAX_LIKE = 500     # max rows from LIKE pass
+    MAX_BULK = 10_000  # max rows for bulk list
 
     def retrieve(self, key: str, parsed: dict) -> tuple:
+        """
+        Returns (records: list[dict], columns: list[str], method: str)
+        method is one of: 'bulk' | 'fts' | 'like_col' | 'like_all' | 'empty'
+        """
         intent = parsed["intent"]
         val    = parsed["search_value"]
         tcol   = parsed["target_col"]
@@ -1047,10 +1275,12 @@ class RAGRetriever:
 
         rows, method = self._fts(key, val, tcol, cols)
         if not rows:
+            # Graceful degradation: FTS miss → LIKE scan
             rows, method = self._like(key, val, tcol, cols)
         return rows, cols, method
 
     def _resolve_col(self, target: str, cols: list) -> Optional[str]:
+        """Find actual column name that best matches the target hint."""
         for c in cols:
             if c.lower() == target.lower():
                 return c
@@ -1060,19 +1290,26 @@ class RAGRetriever:
         return None
 
     def _fts(self, key, val, tcol, cols):
+        """
+        FTS5 BM25 ranked search.
+        Sanitises value (removes FTS special chars), builds column-scoped
+        or all-columns query, joins FTS virtual table with main table
+        to get typed column values back.
+        """
         try:
-            cur = db.conn.cursor()
+            cur  = db.conn.cursor()
             safe = re.sub(r'["()*+\-^~]', " ", val).strip()
             if not safe:
                 return [], "fts_empty"
 
             if tcol:
-                ac = self._resolve_col(tcol, cols)
+                ac    = self._resolve_col(tcol, cols)
                 fts_q = f'"{ac}" : "{safe}"*' if ac else f'"{safe}"*'
             else:
                 words = [w for w in safe.split() if len(w) > 1]
                 if not words:
                     return [], "fts_empty"
+                # OR query: any word present in any column → hit
                 fts_q = " OR ".join(f'"{w}"*' for w in words)
 
             cur.execute(
@@ -1090,6 +1327,7 @@ class RAGRetriever:
             return [], "fts_error"
 
     def _like(self, key, val, tcol, cols):
+        """Broad LIKE search — column-scoped if target_col provided, else all columns."""
         try:
             cur = db.conn.cursor()
             if tcol:
@@ -1103,6 +1341,7 @@ class RAGRetriever:
                     for r in rows:
                         r.pop("_rowid", None)
                     return rows, "like_col"
+            # Search all columns
             conds  = " OR ".join(f'"{c}" LIKE ?' for c in cols)
             params = [f"%{val}%"] * len(cols)
             cur.execute(
@@ -1118,6 +1357,7 @@ class RAGRetriever:
             return [], "like_error"
 
     def _bulk(self, key):
+        """Return all rows up to MAX_BULK — used for 'show all' queries."""
         try:
             cur = db.conn.cursor()
             cur.execute(f'SELECT * FROM "{key}" LIMIT {self.MAX_BULK}')
@@ -1134,11 +1374,20 @@ retriever = RAGRetriever()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# AGGREGATION ENGINE
+# 5. AGGREGATION ENGINE
+# Sums monetary and quantity columns across retrieved records.
+# Uses module registry's amount_cols / qty_cols lists for column targeting.
+# Handles currency symbols and commas before float conversion.
 # ──────────────────────────────────────────────────────────────────────────────
 
 class AggregationEngine:
     def compute(self, records: list, key: str) -> dict:
+        """
+        Returns:
+          count        - number of records
+          total_amount - sum of first matching amount_col (or None)
+          total_qty    - sum of first matching qty_col (or None)
+        """
         mod     = MODULE_REGISTRY[key]
         amt_c   = mod["amount_cols"]
         qty_c   = mod["qty_cols"]
@@ -1154,7 +1403,7 @@ class AggregationEngine:
                         )
                     except (ValueError, TypeError):
                         pass
-                    break
+                    break  # use first matching amount col per record
             for col in qty_c:
                 qk = next((k for k in rec if k.lower() == col.lower()), None)
                 if qk:
@@ -1175,7 +1424,17 @@ aggregator = AggregationEngine()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# RESPONSE SYNTHESIZER — HTML table + natural language intro
+# 6. RESPONSE SYNTHESIZER — HTML generation
+#
+# Generates professional HTML responses. Key design decisions:
+#
+#   • Column visibility — HIDDEN_COLS strips internal/security columns
+#   • Column ordering   — PRIORITY_COLS sorts business-critical cols first
+#   • Cell formatting   — auto-detects currency, qty, datetime, image, badge
+#   • NOT_CURRENCY      — prevents barcodes/codes/IDs from being ₹-formatted
+#   • Marathi support   — table headers, intro text, error messages all
+#                         translated when marathi=True
+#   • Hover row effect  — inline onmouseover/onmouseout (no CSS dependency)
 # ──────────────────────────────────────────────────────────────────────────────
 
 HIDDEN_COLS = {
@@ -1194,15 +1453,17 @@ PRIORITY_COLS = [
     "address", "city", "gstNo", "barcode", "status", "supplyType",
 ]
 
-# ── Column formatting rules ───────────────────────────────────────────────────
+# Semantic hints for currency and quantity detection
 AMOUNT_HINTS = {"price", "amount", "total", "balance", "credit", "debit", "paid", "cost", "value"}
 QTY_HINTS    = {"quantity", "qty", "stock"}
 
-# Columns that look numeric but are NOT currency (codes, IDs, barcodes, etc.)
+# Columns that look numeric but are NOT currency values
+# e.g. "Price Code", "HSN No", "Barcode", "Port" — must NOT get ₹ formatting
 NOT_CURRENCY = {"code", "no", "id", "barcode", "number", "ref", "hsn", "pin", "port"}
 
 
 def _is_currency_col(col: str) -> bool:
+    """True if column likely holds a monetary value and should be ₹-formatted."""
     col_l = col.lower()
     if any(ex in col_l for ex in NOT_CURRENCY):
         return False
@@ -1210,11 +1471,23 @@ def _is_currency_col(col: str) -> bool:
 
 
 def _is_qty_col(col: str) -> bool:
+    """True if column likely holds a quantity (integer, blue/red coloured)."""
     col_l = col.lower()
     return any(h in col_l for h in QTY_HINTS) and not any(ex in col_l for ex in NOT_CURRENCY)
 
 
 def _fmt_cell(col: str, val: str) -> str:
+    """
+    Format a single cell value for HTML display.
+    Detection order:
+      1. Empty / null → em-dash placeholder
+      2. Image URL    → <img> thumbnail
+      3. ISO datetime → compact date+time string
+      4. Currency col → ₹-formatted bold (green/red)
+      5. Qty col      → integer with comma (blue/red)
+      6. Status col   → colour-coded badge pill
+      7. Default      → plain text
+    """
     if not val or val in ("None", "null", ""):
         return '<span style="color:#94a3b8">—</span>'
 
@@ -1227,8 +1500,8 @@ def _fmt_cell(col: str, val: str) -> str:
             f'object-fit:cover;border-radius:6px;" />'
         )
 
-    # Datetime
-    if ("T" in val and val.count("-") >= 2 and len(val) >= 19):
+    # ISO datetime
+    if "T" in val and val.count("-") >= 2 and len(val) >= 19:
         try:
             d, t = val.split("T", 1)
             return f'<span style="color:#64748b;font-size:12px">{d} {t[:5]}</span>'
@@ -1238,7 +1511,7 @@ def _fmt_cell(col: str, val: str) -> str:
     # Currency
     if _is_currency_col(col):
         try:
-            num = float(str(val).replace(",", "").replace("₹", "").strip())
+            num   = float(str(val).replace(",", "").replace("₹", "").strip())
             color = "#16a34a" if num >= 0 else "#dc2626"
             return f'<strong style="color:{color}">₹ {num:,.2f}</strong>'
         except (ValueError, TypeError):
@@ -1247,7 +1520,7 @@ def _fmt_cell(col: str, val: str) -> str:
     # Quantity
     if _is_qty_col(col):
         try:
-            num = int(float(str(val).replace(",", "").strip()))
+            num   = int(float(str(val).replace(",", "").strip()))
             color = "#0369a1" if num > 10 else "#dc2626"
             return f'<span style="color:{color};font-weight:600">{num:,}</span>'
         except (ValueError, TypeError):
@@ -1275,6 +1548,7 @@ def _fmt_cell(col: str, val: str) -> str:
 class ResponseSynthesizer:
 
     def _headers(self, cols: list) -> list:
+        """Filter out hidden columns and sort by PRIORITY_COLS order."""
         lh = {c.lower() for c in HIDDEN_COLS}
         visible = [c for c in cols if c.lower() not in lh]
         return sorted(visible, key=lambda x: (
@@ -1282,12 +1556,21 @@ class ResponseSynthesizer:
         ))
 
     def _col_label(self, col: str, marathi: bool) -> str:
+        """
+        Convert camelCase column name to human-readable label.
+        If marathi=True, translate via MR_COLUMNS dict.
+        """
         eng = re.sub(r"([a-z])([A-Z])", r"\1 \2", col).title()
         return MR_COLUMNS.get(eng, eng) if marathi else eng
 
-    # ── Intro paragraph ───────────────────────────────────────────────────────
+    # ── Natural language intro paragraph ─────────────────────────────────────
     def intro(self, key: str, agg: dict, search_val: str,
               marathi: bool, lang: str) -> str:
+        """
+        Generate a natural language intro paragraph above the data table.
+        Shows: what was searched, how many records found, total amount / qty.
+        Switches to Marathi text when marathi=True.
+        """
         count = agg["count"]
         amt   = agg["total_amount"]
         qty   = agg["total_qty"]
@@ -1338,15 +1621,27 @@ class ResponseSynthesizer:
 
     # ── HTML table ────────────────────────────────────────────────────────────
     def table(self, records: list, cols: list, marathi: bool) -> str:
+        """
+        Build a responsive HTML table with:
+          - Gradient dark header
+          - Alternating row stripes
+          - Hover highlight via inline handlers
+          - Marathi font stack when marathi=True
+          - Column headers translated when marathi=True
+          - Cell values formatted via _fmt_cell()
+        """
         headers = self._headers(cols)
         if not headers:
             return ""
-        font = ("'Noto Sans Devanagari','Segoe UI',system-ui,sans-serif"
-                if marathi else "'Segoe UI',system-ui,sans-serif")
+        font = (
+            "'Noto Sans Devanagari','Segoe UI',system-ui,sans-serif"
+            if marathi else
+            "'Segoe UI',system-ui,sans-serif"
+        )
 
         rows_html = []
         for i, rec in enumerate(records):
-            bg = "#ffffff" if i % 2 == 0 else "#f8fafc"
+            bg    = "#ffffff" if i % 2 == 0 else "#f8fafc"
             cells = ""
             for h in headers:
                 raw  = str(rec.get(h, "") or "")
@@ -1381,8 +1676,9 @@ class ResponseSynthesizer:
             f'</table></div>'
         )
 
-    # ── Error / empty states ──────────────────────────────────────────────────
+    # ── Error / empty state messages ─────────────────────────────────────────
     def no_results(self, key: str, val: str, marathi: bool) -> str:
+        """Zero-results message — bilingual."""
         if marathi:
             label = MR_MODULES.get(key, key)
             return (
@@ -1402,33 +1698,35 @@ class ResponseSynthesizer:
         )
 
     def api_error(self, key: str, marathi: bool) -> str:
+        """API failure message — mentions retry count — bilingual."""
         if marathi:
             label = MR_MODULES.get(key, key)
             return (
                 f'<div style="background:#fff7ed;border:1px solid #fed7aa;'
                 f'border-radius:10px;padding:16px 20px;color:#9a3412;">'
-                f'⚠️ <strong>{label}</strong> चा डेटा मिळवता आला नाही (३ प्रयत्नांनंतर). '
+                f'⚠️ <strong>{label}</strong> चा डेटा मिळवता आला नाही ({API_MAX_RETRIES} प्रयत्नांनंतर). '
                 f'ERP कनेक्शन तपासा.</div>'
             )
         label = key.replace("-", " ").title()
         return (
             f'<div style="background:#fff7ed;border:1px solid #fed7aa;'
             f'border-radius:10px;padding:16px 20px;color:#9a3412;">'
-            f'⚠️ Could not fetch <strong>{label}</strong> data after 3 attempts. '
+            f'⚠️ Could not fetch <strong>{label}</strong> data after {API_MAX_RETRIES} attempts. '
             f'Please check the ERP server connection.</div>'
         )
 
     def prompt_needed(self, key: str, col: str, marathi: bool) -> str:
+        """Asks user to specify a column value when COLUMN_SEARCH has no value."""
         if marathi:
-            label    = MR_MODULES.get(key, key)
-            col_eng  = re.sub(r"([a-z])([A-Z])", r"\1 \2", col).title()
-            col_mr   = MR_COLUMNS.get(col_eng, col_eng)
+            label   = MR_MODULES.get(key, key)
+            col_eng = re.sub(r"([a-z])([A-Z])", r"\1 \2", col).title()
+            col_mr  = MR_COLUMNS.get(col_eng, col_eng)
             return (
                 f'तुम्ही <strong>{label}</strong> विभागात शोधत आहात. '
                 f'कृपया <strong>{col_mr}</strong> सांगा.<br>'
                 f'<em>उदाहरण: "invoice INV-1042" किंवा "name Rahul"</em>'
             )
-        label = key.replace("-", " ").title()
+        label     = key.replace("-", " ").title()
         col_label = re.sub(r"([a-z])([A-Z])", r"\1 \2", col).title()
         return (
             f'You\'re searching <strong>{label}</strong>. '
@@ -1437,6 +1735,7 @@ class ResponseSynthesizer:
         )
 
     def unrecognized(self, marathi: bool) -> str:
+        """Fallback when intent is unknown — shows available modules + examples."""
         if marathi:
             mods = " · ".join(MR_MODULES.values())
             return (
@@ -1456,7 +1755,8 @@ class ResponseSynthesizer:
             f'<div style="background:#f8fafc;border:1px solid #e2e8f0;'
             f'border-radius:10px;padding:16px 20px;">'
             f"<strong>I'm not sure what you're looking for.</strong><br>"
-            f"I can help with: <em>{mods}</em><br><br>Try:<ul>"
+            f"I can help with: <em>{mods}</em><br><br>Try:"
+            f"<ul style='margin:8px 0;padding-left:20px'>"
             f"<li><em>List all purchases</em></li>"
             f"<li><em>Show supplier credits</em></li>"
             f"<li><em>Find customer named Rahul</em></li>"
@@ -1468,7 +1768,12 @@ synth = ResponseSynthesizer()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CONVERSATION CONTEXT
+# 7. CONVERSATION CONTEXT (last 5 turns, in-memory)
+#
+# Lightweight in-process conversation memory.
+# Stores last N turns per session_id.
+# Memory: ~5 turns × ~200 chars = ~1 KB per session. Negligible.
+# Used to remember which module was last queried (for follow-up queries).
 # ──────────────────────────────────────────────────────────────────────────────
 
 class ConversationContext:
@@ -1479,6 +1784,7 @@ class ConversationContext:
         self._sessions[sid].append({"role": role, "text": text[:300]})
 
     def last_module(self, sid: str) -> Optional[str]:
+        """Return the module from the last bot response, if recorded."""
         for turn in reversed(self._sessions[sid]):
             if turn["role"] == "bot":
                 m = re.search(r"_module:(\S+)", turn["text"])
@@ -1491,7 +1797,16 @@ ctx = ConversationContext()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# MAIN ORCHESTRATOR
+# 8. MAIN ORCHESTRATOR
+#
+# Routes each query through:
+#   1. Language detection → Marathi or English path
+#   2. Intent classification (Marathi map OR 5-stage English NLU)
+#   3. Query parsing (extract search value, intent, target column)
+#   4. Data sync (TTL-checked, retry-backed API fetch)
+#   5. Retrieval (FTS5 → LIKE fallback → bulk)
+#   6. Aggregation (sum amounts / qty if requested)
+#   7. Response synthesis (HTML intro + table, bilingual)
 # ──────────────────────────────────────────────────────────────────────────────
 
 class AdminEngine:
@@ -1505,14 +1820,14 @@ class AdminEngine:
         lang       = detect_language(user_query)
         is_marathi = lang in ("marathi_devanagari", "marathi_roman")
 
-        # ── Marathi path ──────────────────────────────────────────────────────
+        # ── Marathi path — bypass 5-stage NLU, use direct keyword map ────────
         if is_marathi:
             key = marathi_classify(user_query)
             if key:
                 return await self._single(key, user_query, session_id, lang, marathi=True)
             return synth.unrecognized(marathi=True)
 
-        # ── English path ──────────────────────────────────────────────────────
+        # ── English path — 5-stage NLU classifier ────────────────────────────
         cl = self.classifier.classify(user_query)
 
         if cl["type"] == "UNRECOGNIZED":
@@ -1540,8 +1855,9 @@ class AdminEngine:
         if not records:
             return synth.no_results(key, parsed["search_value"], marathi)
 
-        agg  = aggregator.compute(records, key)
+        agg = aggregator.compute(records, key)
 
+        # Aggregation-only response (e.g. "how many purchases total?")
         if parsed["aggregation"] == "SUM" and parsed["intent"] != "BULK_LIST":
             parts = [f'<strong>{key.replace("-"," ").title()}</strong> — {agg["count"]:,} records']
             if agg["total_amount"]:
@@ -1561,6 +1877,11 @@ class AdminEngine:
 
     # ── Multi-module handler ──────────────────────────────────────────────────
     async def _multi(self, pattern: dict, query: str, sid: str) -> str:
+        """
+        Handles compound queries like "financial summary" or "supplier overview".
+        Fetches all listed modules concurrently via sync_modules().
+        Renders each module as a separate labelled section under a summary header.
+        """
         keys   = pattern["modules"]
         label  = pattern["label"]
         synced = await db.sync_modules(keys)
@@ -1578,14 +1899,14 @@ class AdminEngine:
                 )
                 continue
 
-            parsed  = self.parser.parse(query, key, "english")
-            parsed["intent"] = "BULK_LIST"
+            parsed = self.parser.parse(query, key, "english")
+            parsed["intent"]       = "BULK_LIST"   # always show all data for multi
             parsed["search_value"] = ""
             records, cols, _ = retriever.retrieve(key, parsed)
             if not records:
                 continue
 
-            agg = aggregator.compute(records, key)
+            agg      = aggregator.compute(records, key)
             total_a += agg["total_amount"] or 0
             total_q += agg["total_qty"]    or 0
 
@@ -1622,7 +1943,7 @@ engine = AdminEngine()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# STATIC RESPONSES
+# 9. STATIC RESPONSES — greetings, identity, refresh
 # ──────────────────────────────────────────────────────────────────────────────
 
 GREETING_EN = """
@@ -1683,36 +2004,41 @@ IDENTITY_RESPONSE = """
     🧠 Admin Intelligence Engine v5.0
   </p>
   <p style="margin:0 0 16px;color:#475569">
-    A production-grade <strong>RAG pipeline</strong> for ERP — zero external AI APIs,
-    full Marathi support, &lt;120 MB RAM.
+    A production-grade <strong>RAG pipeline</strong> for ERP —
+    zero external AI APIs, full Marathi support, &lt;120 MB RAM.
   </p>
+
   <div style="background:#f8fafc;border-radius:10px;padding:16px;margin-bottom:12px">
-    <strong style="color:#6366f1">Query Pipeline (English):</strong>
+    <strong style="color:#6366f1">5-Stage NLU Pipeline (English):</strong>
     <ol style="margin:8px 0;padding-left:20px;color:#334155;line-height:1.9;font-size:14px">
-      <li>Multi-module pattern detection</li>
-      <li>Phrase matching (longest wins)</li>
-      <li>Keyword scoring with confidence</li>
-      <li>Fuzzy alias matching (catches typos)</li>
-      <li>TF-IDF cosine similarity fallback</li>
+      <li><strong>Multi-module pattern detection</strong> — compound queries like "financial summary"</li>
+      <li><strong>Phrase matching</strong> — longest phrase wins ("supplier credit" beats "credit")</li>
+      <li><strong>Keyword scoring</strong> — weighted frequency with confidence scores</li>
+      <li><strong>Fuzzy alias matching</strong> — catches typos like "purchaces" → purchases</li>
+      <li><strong>TF-IDF cosine similarity</strong> — semantic fallback for unusual phrasing</li>
     </ol>
   </div>
+
   <div style="background:#f0fdf4;border-radius:10px;padding:16px;margin-bottom:12px">
     <strong style="color:#16a34a">Marathi Pipeline:</strong>
     <ul style="margin:8px 0;padding-left:20px;color:#334155;line-height:1.9;font-size:14px">
-      <li>Unicode Devanagari detection + Roman phonetic markers</li>
+      <li>Unicode Devanagari detection (U+0900–U+097F) + Roman phonetic markers</li>
       <li>206-keyword intent map with longest-match algorithm</li>
-      <li>Devanagari inflection stemming (उत्पादने→उत्पादन)</li>
-      <li>120+ stop words so filler never leaks into search</li>
-      <li>Full Marathi output (headers, summaries, errors)</li>
+      <li>Devanagari inflection stemming (उत्पादने→उत्पादन, साठ्याची→साठा)</li>
+      <li>120+ stop words — filler like "mala dakhva", "kiti ahe" never leaks into search</li>
+      <li>Full Marathi output — table headers, summaries, errors all translated</li>
     </ul>
   </div>
+
   <div style="background:#fff7ed;border-radius:10px;padding:16px">
     <strong style="color:#d97706">Data Layer:</strong>
     <ul style="margin:8px 0;padding-left:20px;color:#334155;line-height:1.9;font-size:14px">
-      <li>SQLite FTS5 + BM25 ranking (10× faster than LIKE)</li>
-      <li>API retry with exponential backoff (3 attempts)</li>
-      <li>TTL-based caching: stock 2min, finance 10min, master 5min</li>
-      <li>Multi-API concurrent fetch for compound queries</li>
+      <li>SQLite FTS5 + BM25 ranking — 5-10× faster than LIKE, relevance-sorted</li>
+      <li>Fallback chain: FTS5 → LIKE column → LIKE all-cols (graceful degradation)</li>
+      <li>API retry with exponential backoff — 3 attempts (1.5s, 3s, 6s)</li>
+      <li>TTL-based caching: stock 2min · finance 10min · master 5min</li>
+      <li>Multi-module concurrent fetch via asyncio.gather()</li>
+      <li>🔒 100% private — no data leaves your server · ⚡ Zero AI API cost</li>
     </ul>
   </div>
 </div>
@@ -1720,7 +2046,7 @@ IDENTITY_RESPONSE = """
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# FASTAPI ENDPOINT
+# 10. FASTAPI ENDPOINT
 # ──────────────────────────────────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
@@ -1729,20 +2055,29 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = "default"
 
 
-_EN_GREET = {"hi", "hello", "hey", "heyy", "heya", "good morning",
-             "good afternoon", "good evening", "sup", "yo"}
-_EN_THANKS = {"thank you", "thanks", "awesome", "perfect", "great",
-              "nice", "good", "ok", "okay", "cool"}
+# Quick-response word sets — matched before hitting the main pipeline
+_EN_GREET    = {"hi", "hello", "hey", "heyy", "heya", "good morning",
+                "good afternoon", "good evening", "sup", "yo"}
+_EN_THANKS   = {"thank you", "thanks", "awesome", "perfect", "great",
+                "nice", "good", "ok", "okay", "cool"}
 _EN_IDENTITY = {"who are you", "how do you work", "chatgpt", "your brain",
                 "how were you built", "architecture", "how does this work"}
-_EN_REFRESH = {"refresh", "sync", "update records", "reload data"}
-_MR_GREET_W = {"नमस्कार", "नमस्ते", "हॅलो", "namaskar", "namaste"}
+_EN_REFRESH  = {"refresh", "sync", "update records", "reload data"}
+_MR_GREET_W  = {"नमस्कार", "नमस्ते", "हॅलो", "namaskar", "namaste"}
 _MR_THANKS_W = {"धन्यवाद", "आभारी", "थँक्यू", "dhanyavad", "aabhari"}
-_MR_REFRESH_W = {"रिफ्रेश", "अद्यतन", "refresh kara", "update kara", "sync kara"}
+_MR_REFRESH_W= {"रिफ्रेश", "अद्यतन", "refresh kara", "update kara", "sync kara"}
 
 
 @router.post("/chat")
 async def chat_endpoint(request: ChatRequest):
+    """
+    Main chat endpoint.
+
+    Flow:
+      1. Detect language
+      2. Handle quick responses (greetings, thanks, refresh, identity)
+      3. Delegate to AdminEngine.process() for data queries
+    """
     query      = (request.query or request.question or "").strip()
     session_id = request.session_id or "default"
 
@@ -1793,6 +2128,6 @@ async def chat_endpoint(request: ChatRequest):
                 '</div>'
             )}
 
-    # ── Main pipeline ─────────────────────────────────────────────────────────
+    # ── Main intelligence pipeline ────────────────────────────────────────────
     response = await engine.process(query, session_id)
     return {"response": response}
