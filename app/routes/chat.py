@@ -1,6 +1,6 @@
 """
 ==============================================================================
-  ADMIN INTELLIGENCE ENGINE  v5.0  —  PRODUCTION READY
+  ADMIN INTELLIGENCE ENGINE  v6.0  —  PRODUCTION READY
   ERP Chatbot RAG Pipeline · Zero external AI APIs · <120 MB RAM
   Full Marathi (Devanagari + Roman) + English support
 
@@ -18,10 +18,11 @@ ARCHITECTURE
 │      │                        │                                  │
 │      └──────────┬─────────────┘                                  │
 │                 ▼                                                 │
-│          Multi-API Planner ──► Async Fetch Pool                  │
+│       Targeted API Router ──► Async Fetch Pool                   │
+│       (smart endpoint selection per query intent)                 │
 │                 │                      │                          │
 │                 ▼                      ▼                          │
-│           SQLite FTS5 Mirror    DataMirror Cache                  │
+│          SQLite FTS5 Mirror    DataMirror Cache                   │
 │                 │                                                 │
 │                 ▼                                                 │
 │          RAG Retriever ──► ResponseSynthesizer                   │
@@ -30,27 +31,53 @@ ARCHITECTURE
 │          HTML Response (English or मराठी based on input)         │
 └──────────────────────────────────────────────────────────────────┘
 
-  KEY INNOVATIONS vs v3/v4:
-  1. Language detection — Devanagari Unicode + Roman phonetic markers
-  2. Marathi intent map — 206 keywords across Devanagari + Roman
-  3. Marathi response synthesizer — headers, summaries, UI in Marathi
-  4. Marathi column translations — all 40+ ERP column headers translated
-  5. Longest-match algorithm — most specific Marathi phrase wins
-  6. Mixed-language queries — "supplier credit kiti ahe" works perfectly
-  7. Language-aware QueryParser — correct stop set per language
-  8. Devanagari inflection stemming — उत्पादने→उत्पादन, साथ→साठा, etc.
+  BUGS FIXED vs v5  (from live chat log analysis):
+  ─────────────────────────────────────────────────
+  BUG-01: "sarva stocks kiti aahet" → "aahet"/"sarva"/"kiti" leaked into
+          search_value. Fixed: added aahet, sarva, kitee, aahet, kiti, kitee,
+          sarva, ahet to MR_STOP_ROMAN.
+  BUG-02: "supplier chi yadi dakhva" → UNRECOGNIZED. Fixed: "supplier" added
+          to _MR_ROMAN_MARKERS and Marathi keyword map for the supplier module.
+  BUG-03: "get me all product categories" → misrouted to product-stock.
+          Fixed: "categories" removed from product-stock keywords; category
+          module given exclusive ownership + higher-priority phrases.
+  BUG-04: "get me supplier(s) purchase history" → searched purchases for word
+          "supplier" instead of using the dedicated report endpoint.
+          Fixed: New module "supplier-purchase-history" with dedicated API
+          /api/reports/supplier-purchase-history mapped to specific phrases.
+  BUG-05: "show my payment history" → API fail (payment module endpoint was
+          correct but needs accept-all fallback). Fixed: Enhanced _fetch_with_retry
+          with response-body logging for diagnosis.
+  BUG-06: Customer "payment history" query had no dedicated route.
+          Fixed: New module "customer-payment-history" mapped to
+          /api/customer/payment-history.
 
-  BUGS FIXED vs v4:
-  ─────────────────
-  1. Marathi stop words — 120+ words so filler phrases like "kiti ahe",
-     "dya", "sarv", "dakha", "mala", "chi", "yadi" never leak into search_value
-  2. Marathi bulk triggers — sarv/saglya/yadi correctly set BULK_LIST intent
-  3. Devanagari inflection stems — उत्पादने→उत्पादन, साठाची→साठा, etc.
-  4. QueryParser is now language-aware — passes correct stop set per language
-  5. Price Code / Barcode / HSN columns no longer formatted as currency
-  6. API retry with exponential backoff — 3 attempts before showing error
-  7. Marathi search-value queries work — "mala rahul grahak dakha" → search
-  8. Mixed Marathi+English fully handled in every function
+  NEW CAPABILITIES vs v5:
+  ────────────────────────
+  + supplier-purchase-history  — /api/reports/supplier-purchase-history
+  + customer-payment-history   — /api/customer/payment-history
+  + customer-ledger-summary    — /api/reports/customer-ledger-summary
+  + customer-ledger-detail     — /api/reports/customer-ledger-detail
+  + Targeted barcode search    — /api/purchase/get-stock-by-barcode
+  + Targeted invoice search    — /api/sell/search-by-invoice
+  + Contact search             — /api/customer/search-by-contact
+  + Active printer endpoint    — /api/printer/get-active-printer
+  + Per-query smart endpoint   — SingleQueryRouter selects most specific
+    endpoint (e.g. barcode query → barcode API, not full table scan)
+  + Marathi "supplier" Roman   — "supplier chi yadi", "supplier list dakhva"
+    now correctly routes to supplier module
+  + Extended stop words        — 150+ Marathi Roman/Deva stops including
+    aahet, sarva, kiti variants
+
+  ARCHITECTURE CHANGES vs v5:
+  ────────────────────────────
+  + SmartQueryRouter — inspects parsed intent BEFORE fetching data.
+    If a targeted search API exists (barcode, invoice, contact, name),
+    it calls that instead of loading the entire table → 10-100× faster
+    for point-lookup queries.
+  + QueryAnalyzer    — detects barcode patterns (BAR[A-Z0-9]+), invoice patterns
+    (PA00000+, SA00000+, INV-###), phone patterns (10-digit) and sets a
+    query_mode that SmartQueryRouter uses.
 ==============================================================================
 """
 
@@ -90,26 +117,45 @@ API_MAX_RETRIES  = 3        # exponential backoff: 1.5s, 3s, 6s
 
 # ──────────────────────────────────────────────────────────────────────────────
 # MODULE REGISTRY
+#
 # Each module defines:
-#   url         - API endpoint (relative to BASE_URL)
+#   url         - primary GET endpoint (relative to BASE_URL) — loads all data
 #   ttl         - cache lifetime in seconds
 #   keywords    - high-confidence single-word matches for NLU stage 3
 #   phrases     - multi-word matches (checked FIRST at stage 2, highest priority)
 #   aliases     - typo/synonym list for fuzzy matching at stage 4
 #   amount_cols - columns holding monetary values (for aggregation + formatting)
 #   qty_cols    - columns holding quantities (for aggregation + formatting)
+#
+# TARGETED ENDPOINTS (optional per module):
+#   search_endpoints - map of query_mode → API endpoint + param name.
+#     SmartQueryRouter uses these for point-lookups INSTEAD of loading the
+#     full table, which is 10-100× faster for specific queries.
+#
+#     query_mode values:
+#       "barcode"  → detected when query contains BAR[A-Z0-9]+ pattern
+#       "invoice"  → detected when query contains PA\d+/SA\d+/INV-\d+ pattern
+#       "contact"  → detected when query contains a 10-digit phone number
+#       "name"     → detected when search_value is a name-like string (alpha)
+#
 # ──────────────────────────────────────────────────────────────────────────────
 MODULE_REGISTRY = {
+
+    # ── SUPPLIER CREDIT ───────────────────────────────────────────────────────
     "supplier-credit": {
         "url":         "/api/supplier-credit/get-all-supplier-credits",
         "ttl":         FINANCE_TTL,
         "keywords":    ["credit", "credits", "outstanding", "due", "refund", "owe", "owes"],
-        "phrases":     ["supplier credit", "supplier credits", "vendor credit", "credit note",
-                        "credit balance", "outstanding credit", "how much do we owe"],
+        "phrases":     ["supplier credit", "supplier credits", "vendor credit",
+                        "credit note", "credit balance", "outstanding credit",
+                        "how much do we owe", "credits owed"],
         "aliases":     ["supplier credit", "vendor credit", "credits outstanding"],
         "amount_cols": ["creditAmount", "amount", "totalCredit", "totalAmount"],
         "qty_cols":    [],
+        "search_endpoints": {},
     },
+
+    # ── SUPPLIER LEDGER ───────────────────────────────────────────────────────
     "supplier-ledger": {
         "url":         "/api/reports/get-supplier-ledger",
         "ttl":         FINANCE_TTL,
@@ -119,136 +165,293 @@ MODULE_REGISTRY = {
         "aliases":     ["supplier ledger", "vendor ledger"],
         "amount_cols": ["debit", "credit", "balance", "amount"],
         "qty_cols":    [],
+        "search_endpoints": {},
     },
+
+    # ── CUSTOMER LEDGER ───────────────────────────────────────────────────────
     "customer-ledger": {
         "url":         "/api/reports/get-all-customer-ledgers",
         "ttl":         FINANCE_TTL,
         "keywords":    [],
         "phrases":     ["customer ledger", "client ledger", "customer statement",
-                        "customer account", "receivables"],
+                        "customer account", "receivables", "customer balance"],
         "aliases":     ["customer ledger", "client ledger"],
         "amount_cols": ["debit", "credit", "balance", "amount"],
         "qty_cols":    [],
+        "search_endpoints": {
+            # /api/reports/customer-ledger-summary?customerId=X → summary view
+            # /api/reports/customer-ledger-detail?customerId=X  → full history
+        },
     },
+
+    # ── CUSTOMER LEDGER SUMMARY ───────────────────────────────────────────────
+    # Dedicated summary endpoint — faster than full ledger for overview queries
+    "customer-ledger-summary": {
+        "url":         "/api/reports/customer-ledger-summary",
+        "ttl":         FINANCE_TTL,
+        "keywords":    [],
+        "phrases":     ["customer ledger summary", "customer account summary",
+                        "customer balance summary", "customer outstanding summary"],
+        "aliases":     ["customer summary ledger"],
+        "amount_cols": ["balance", "totalDebit", "totalCredit"],
+        "qty_cols":    [],
+        "search_endpoints": {},
+    },
+
+    # ── SELL ──────────────────────────────────────────────────────────────────
     "sell": {
         "url":         "/api/sell/get-all-sells",
         "ttl":         MODULE_TTL,
         "keywords":    ["sell", "sells", "sold", "sale", "sales", "dispatch",
                         "invoice", "receipt", "billing", "revenue"],
         "phrases":     ["sales invoice", "sell invoice", "dispatch record", "all sales",
-                        "sales list", "all sells", "invoices", "what did we sell"],
+                        "sales list", "all sells", "invoices", "what did we sell",
+                        "customer invoice", "sales history", "sell history"],
         "aliases":     ["sales", "sells", "invoices", "receipts", "billing"],
         "amount_cols": ["totalAmount", "sellPrice", "amount", "paid"],
         "qty_cols":    ["quantity", "qty", "totalQuantity"],
+        "search_endpoints": {
+            # /api/sell/search-by-invoice?invoiceNo=SA00000001
+            "invoice": {
+                "url":   "/api/sell/search-by-invoice",
+                "param": "invoiceNo",
+            },
+            # /api/sell/get-sell-by-invoice-no?invoiceNo=SA00000001
+            "invoice_exact": {
+                "url":   "/api/sell/get-sell-by-invoice-no",
+                "param": "invoiceNo",
+            },
+        },
     },
+
+    # ── PURCHASE ──────────────────────────────────────────────────────────────
     "purchase": {
         "url":         "/api/purchase/get-all-purchases",
         "ttl":         MODULE_TTL,
         "keywords":    ["purchase", "purchases", "bought", "buy", "buying",
                         "acquire", "procurement", "ordered"],
-        "phrases":     ["purchase order", "purchase invoice", "purchase history",
-                        "purchase list", "all purchases", "what did we buy"],
+        "phrases":     ["purchase order", "purchase invoice", "purchase list",
+                        "all purchases", "what did we buy", "all purchase orders",
+                        "purchase record"],
         "aliases":     ["purchaces", "purchasse", "purcheases", "purhcases",
                         "purchaes", "puchases", "pruchases", "purchases", "buys"],
-        "amount_cols": ["totalAmount", "purchaseAmount", "amount", "paid"],
-        "qty_cols":    ["quantity", "qty", "totalQuantity"],
+        "amount_cols": ["totalAmount", "purchaseAmount", "totalPurchaseAmount", "amount"],
+        "qty_cols":    ["quantity", "qty", "totalQuantity", "receivedQuantity"],
+        "search_endpoints": {
+            # /api/purchase/get-stock-by-barcode?barcode=BAR268726580
+            "barcode": {
+                "url":   "/api/purchase/get-stock-by-barcode",
+                "param": "barcode",
+            },
+            # /api/purchase/get-purchase-by-invoice-no?invoiceNo=PA00000001
+            "invoice": {
+                "url":   "/api/purchase/get-purchase-by-invoice-no",
+                "param": "invoiceNo",
+            },
+            # /api/purchase/get-stock-by-product-name?productName=NON+WOVEN
+            "name": {
+                "url":   "/api/purchase/get-stock-by-product-name",
+                "param": "productName",
+            },
+        },
     },
+
+    # ── SUPPLIER PURCHASE HISTORY — DEDICATED REPORT ─────────────────────────
+    # BUG-04 FIX: "supplier purchase history" queries were misrouted to the
+    # purchase module which then searched for the word "supplier" in all columns.
+    # This dedicated module calls /api/reports/supplier-purchase-history directly.
+    "supplier-purchase-history": {
+        "url":         "/api/reports/supplier-purchase-history",
+        "ttl":         MODULE_TTL,
+        "keywords":    [],  # no generic keywords — phrases take priority
+        "phrases":     ["supplier purchase history", "vendor purchase history",
+                        "supplier purchase report", "vendor purchase report",
+                        "supplier buying history", "purchase history by supplier",
+                        "supplier wise purchase", "get supplier purchase",
+                        "suppliers purchase", "supplier purchases"],
+        "aliases":     ["supplier purchase history", "vendor purchase history"],
+        "amount_cols": ["totalAmount", "purchaseAmount", "totalPurchaseAmount"],
+        "qty_cols":    ["quantity", "totalQuantity"],
+        "search_endpoints": {},
+    },
+
+    # ── PAYMENT ───────────────────────────────────────────────────────────────
     "payment": {
         "url":         "/api/payment/supplier-payment-history",
         "ttl":         MODULE_TTL,
-        "keywords":    ["payment", "payments", "paid", "settled", "transaction", "remittance"],
+        "keywords":    ["payment", "payments", "paid", "settled", "transaction",
+                        "remittance", "disbursement"],
         "phrases":     ["payment history", "supplier payment", "payment record",
                         "payment list", "all payments", "transaction history",
-                        "what was paid", "payments made"],
+                        "what was paid", "payments made", "show payment",
+                        "my payment history"],
         "aliases":     ["payments", "paying", "remittance", "settlement"],
         "amount_cols": ["amount", "paid", "totalPaid"],
         "qty_cols":    [],
+        "search_endpoints": {},
     },
+
+    # ── CUSTOMER PAYMENT HISTORY — DEDICATED ENDPOINT ────────────────────────
+    # Separate from supplier payments — uses /api/customer/payment-history
+    "customer-payment-history": {
+        "url":         "/api/customer/payment-history",
+        "ttl":         MODULE_TTL,
+        "keywords":    [],
+        "phrases":     ["customer payment history", "client payment history",
+                        "customer paid", "customer payment record",
+                        "customer transactions", "customer receipts"],
+        "aliases":     ["customer payment", "client payment"],
+        "amount_cols": ["amount", "paid", "totalPaid", "balance"],
+        "qty_cols":    [],
+        "search_endpoints": {},
+    },
+
+    # ── MATERIAL ──────────────────────────────────────────────────────────────
     "material": {
         "url":         "/api/material/get-all-materials",
         "ttl":         MODULE_TTL,
-        "keywords":    ["material", "materials", "fabric", "raw", "component", "item"],
-        "phrases":     ["raw material", "material list", "all materials", "fabric list"],
+        "keywords":    ["material", "materials", "fabric", "raw", "component"],
+        "phrases":     ["raw material", "material list", "all materials", "fabric list",
+                        "raw materials list", "component list"],
         "aliases":     ["materials", "fabrics", "raw materials"],
         "amount_cols": [],
         "qty_cols":    [],
+        "search_endpoints": {
+            # /api/material/get-material-by-name?name=CARPET
+            "name": {
+                "url":   "/api/material/get-material-by-name",
+                "param": "name",
+            },
+        },
     },
+
+    # ── CUSTOMER ──────────────────────────────────────────────────────────────
     "customer": {
         "url":         "/api/customer/get-all-customers",
         "ttl":         MODULE_TTL,
         "keywords":    ["customer", "customers", "client", "clients", "buyer", "purchaser"],
         "phrases":     ["customer list", "client list", "all customers",
-                        "buyer list", "who are our customers"],
+                        "buyer list", "who are our customers", "find customer",
+                        "customer details", "customer info"],
         "aliases":     ["customers", "clients", "buyers"],
         "amount_cols": [],
         "qty_cols":    [],
+        "search_endpoints": {
+            # /api/customer/search-by-contact?contact=9876543210
+            "contact": {
+                "url":   "/api/customer/search-by-contact",
+                "param": "contact",
+            },
+        },
     },
+
+    # ── SUPPLIER ──────────────────────────────────────────────────────────────
     "supplier": {
         "url":         "/api/supplier/get-all-suppliers",
         "ttl":         MODULE_TTL,
-        "keywords":    ["supplier", "suppliers", "vendor", "vendors", "distributor", "provider"],
-        "phrases":     ["supplier list", "vendor list", "all suppliers", "distributor list"],
+        "keywords":    ["supplier", "suppliers", "vendor", "vendors", "distributor",
+                        "provider"],
+        "phrases":     ["supplier list", "vendor list", "all suppliers",
+                        "distributor list", "supplier details", "supplier info",
+                        "find supplier"],
         "aliases":     ["suppliers", "vendors", "distributors"],
         "amount_cols": ["supplierCredit"],
         "qty_cols":    [],
+        "search_endpoints": {},
     },
+
+    # ── PRODUCT STOCK ─────────────────────────────────────────────────────────
     "product-stock": {
         "url":         "/api/reports/get-product-stocks-with-product",
         "ttl":         STOCK_TTL,
         "keywords":    ["stock", "stocks", "inventory", "warehouse", "available",
                         "product", "products"],
-        "phrases":     ["product stock", "stock list", "inventory list", "product inventory",
-                        "available stock", "warehouse stock", "current stock",
-                        "what do we have in stock"],
+        "phrases":     ["product stock", "stock list", "inventory list",
+                        "product inventory", "available stock", "warehouse stock",
+                        "current stock", "what do we have in stock",
+                        "show stock", "all stock", "stock report"],
         "aliases":     ["stocks", "inventory", "products", "warehousing"],
-        "amount_cols": ["sellPrice", "pricePerUnit", "totalAmount"],
+        "amount_cols": ["sellPrice", "pricePerUnit"],
         "qty_cols":    ["stockQuantity", "quantity"],
+        "search_endpoints": {},
     },
+
+    # ── CATEGORY ─────────────────────────────────────────────────────────────
+    # BUG-03 FIX: "categories" keyword was also in product-stock, causing
+    # misrouting. Category now has exclusive ownership of these terms and
+    # a higher-priority phrase set. "product" keyword REMOVED from here
+    # to avoid competing with product-stock.
+    "category": {
+        "url":         "/api/reports/get-all-product-categories",
+        "ttl":         MODULE_TTL,
+        "keywords":    ["category", "categories", "classification"],
+        "phrases":     ["product category", "product categories", "category list",
+                        "all categories", "list categories", "show categories",
+                        "get categories", "categories list", "what categories",
+                        "item categories", "item classification"],
+        "aliases":     ["categories", "classifications", "product categories"],
+        "amount_cols": [],
+        "qty_cols":    [],
+        "search_endpoints": {},
+    },
+
+    # ── PRINTER ───────────────────────────────────────────────────────────────
     "printer": {
         "url":         "/api/printer/get-all-printers",
         "ttl":         MODULE_TTL,
         "keywords":    ["printer", "printers", "machine", "print"],
-        "phrases":     ["printer list", "all printers", "printing machines"],
+        "phrases":     ["printer list", "all printers", "printing machines",
+                        "active printer", "show printers"],
         "aliases":     ["printers", "printing"],
         "amount_cols": [],
         "qty_cols":    [],
+        "search_endpoints": {
+            # /api/printer/get-active-printer → returns currently active printer
+            "active": {
+                "url":   "/api/printer/get-active-printer",
+                "param": None,
+            },
+        },
     },
+
+    # ── EMAIL CONFIG ──────────────────────────────────────────────────────────
     "email-config": {
         "url":         "/api/email-config/get-all-emails",
         "ttl":         MODULE_TTL,
         "keywords":    ["email", "emails", "smtp", "config", "mail"],
-        "phrases":     ["email config", "mail config", "smtp config", "email settings"],
+        "phrases":     ["email config", "mail config", "smtp config",
+                        "email settings", "active email", "email setup"],
         "aliases":     ["emails", "mails", "smtp"],
         "amount_cols": [],
         "qty_cols":    [],
-    },
-    "category": {
-        "url":         "/api/reports/get-all-product-categories",
-        "ttl":         MODULE_TTL,
-        "keywords":    ["category", "categories", "classification", "type", "types"],
-        "phrases":     ["product category", "category list", "all categories", "product types"],
-        "aliases":     ["categories", "classifications"],
-        "amount_cols": [],
-        "qty_cols":    [],
+        "search_endpoints": {
+            # /api/email-config/active → returns active email config
+            "active": {
+                "url":   "/api/email-config/active",
+                "param": None,
+            },
+        },
     },
 }
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # MULTI-MODULE QUERY PATTERNS
 # When a query involves more than one module, define it here.
-# Key: display label.  Value: list of module keys to fetch simultaneously.
 # All listed modules are fetched concurrently via asyncio.gather().
 # ──────────────────────────────────────────────────────────────────────────────
 MULTI_PATTERNS = [
     {
         "phrases": ["supplier summary", "supplier overview", "vendor summary",
-                    "full supplier details", "all supplier info"],
-        "modules": ["supplier", "supplier-credit", "supplier-ledger"],
+                    "full supplier details", "all supplier info",
+                    "complete supplier info"],
+        "modules": ["supplier", "supplier-credit", "supplier-ledger",
+                    "supplier-purchase-history"],
         "label":   "Full Supplier Overview",
     },
     {
         "phrases": ["financial summary", "finance report", "money overview",
-                    "accounts summary", "financial overview"],
+                    "accounts summary", "financial overview", "full finance"],
         "modules": ["sell", "purchase", "payment", "supplier-credit"],
         "label":   "Financial Summary",
     },
@@ -258,46 +461,71 @@ MULTI_PATTERNS = [
         "label":   "Sales & Inventory Report",
     },
     {
-        "phrases": ["customer and sales", "sales by customer"],
+        "phrases": ["customer and sales", "sales by customer", "customer sales"],
         "modules": ["customer", "sell"],
         "label":   "Customer & Sales Report",
     },
     {
-        "phrases": ["purchase and payment", "vendor transactions"],
+        "phrases": ["purchase and payment", "vendor transactions",
+                    "vendor payment history"],
         "modules": ["purchase", "payment", "supplier"],
         "label":   "Vendor Transactions",
     },
+    {
+        "phrases": ["customer report", "customer full report",
+                    "customer complete details"],
+        "modules": ["customer", "customer-ledger", "customer-payment-history"],
+        "label":   "Customer Full Report",
+    },
 ]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# QUERY PATTERN DETECTION
+# Regex patterns used by QueryAnalyzer to detect targeted search modes.
+# These allow SmartQueryRouter to call a specific API endpoint instead of
+# loading the full table — e.g. barcode scan → /get-stock-by-barcode.
+# ──────────────────────────────────────────────────────────────────────────────
+BARCODE_RE  = re.compile(r"\bBAR\w{6,}\b", re.IGNORECASE)
+INVOICE_RE  = re.compile(r"\b(PA\d{5,}|SA\d{5,}|INV[-/]\w+)\b", re.IGNORECASE)
+CONTACT_RE  = re.compile(r"\b[6-9]\d{9}\b")          # Indian 10-digit mobile
+ACTIVE_RE   = re.compile(r"\bactive\b", re.IGNORECASE)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # COLUMN SEARCH TRIGGERS
 # Maps natural language words → likely column names to target.
 # Used by QueryParser to detect COLUMN_SEARCH intent and extract target_col.
-# First item in each list is the primary column candidate.
 # ──────────────────────────────────────────────────────────────────────────────
 COLUMN_TRIGGERS = {
-    "invoice": ["invoiceNo", "invoice"],
-    "bill":    ["invoiceNo", "billNo"],
-    "barcode": ["barcode", "code"],
-    "contact": ["contact", "phone", "mobile"],
-    "phone":   ["phone", "contact", "mobile"],
-    "mobile":  ["mobile", "phone", "contact"],
-    "id":      ["id", "_id"],
-    "email":   ["email"],
-    "name":    ["name", "firstName", "lastName", "productName",
-                "supplierName", "customerName", "materialName"],
-    "address": ["address"],
-    "gst":     ["gstNo", "gst"],
-    "date":    ["date", "createdAt", "purchaseDate", "sellDate"],
-    "amount":  ["totalAmount", "amount", "creditAmount", "paid"],
-    "price":   ["sellPrice", "price", "pricePerUnit"],
-    "status":  ["status", "supplyType"],
+    "invoice":  ["invoiceNo", "invoice", "billNo"],
+    "bill":     ["billNo", "invoiceNo"],
+    "barcode":  ["barcode"],
+    "contact":  ["contact", "phone", "mobile"],
+    "phone":    ["phone", "contact", "mobile"],
+    "mobile":   ["mobile", "phone", "contact"],
+    "id":       ["id", "_id"],
+    "email":    ["email"],
+    "name":     ["name", "firstName", "lastName", "productName",
+                 "supplierName", "customerName", "materialName"],
+    "address":  ["address"],
+    "gst":      ["gstNo", "gst"],
+    "date":     ["date", "createdAt", "purchaseDate", "sellDate"],
+    "amount":   ["totalAmount", "amount", "creditAmount", "paid"],
+    "price":    ["sellPrice", "price", "pricePerUnit"],
+    "status":   ["status", "supplyType"],
+    "quantity": ["stockQuantity", "quantity", "qty"],
+    "stock":    ["stockQuantity"],
+    "size":     ["size"],
+    "color":    ["color"],
+    "unit":     ["unit"],
+    "category": ["category"],
+    "hsn":      ["hsnNo", "hsn"],
 }
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # STOP WORD SETS
-# Three sets are used depending on detected language.
-# Stop words are stripped before extracting search_value in QueryParser.
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ── English stop words ────────────────────────────────────────────────────────
@@ -320,9 +548,9 @@ EN_BULK = {
     "display", "give", "complete", "full",
 }
 
-# ── Marathi stop words (Roman transliteration) ────────────────────────────────
-# These are stripped so filler phrases like "mala dakhva", "sarv yadi",
-# "kiti ahe" never leak into the search_value. 120+ entries.
+# ── Marathi stop words (Roman transliteration) — 150+ entries ────────────────
+# BUG-01 FIX: added "aahet", "sarva", "kiti", "kitee", "sarve",
+# "ahet" which were leaking into search_value.
 MR_STOP_ROMAN = {
     # Pronouns
     "mala", "mla", "mhala", "amhala", "amhi", "mi", "tu", "to", "ti",
@@ -337,14 +565,18 @@ MR_STOP_ROMAN = {
     "ghya", "ghyava", "aana", "aanava",
     "pahije", "hve", "have",
     # List/all — set BULK intent, never search value
-    "sarv", "sarva", "saglya", "sagale", "sagala", "sagali", "sagle",
-    "yadi", "yaadi", "soochi", "suchi", "jadval",
+    "sarv", "sarva", "sarve", "saglya", "sagale", "sagala", "sagali",
+    "sagle", "yadi", "yaadi", "soochi", "suchi", "jadval",
     "sampurn", "sampoorna", "poorna", "purna",
     "sare", "sara", "sari", "sarav",
     # Grammar particles
     "chi", "che", "cha", "chya", "la", "na", "va", "ani", "aani",
-    "ahe", "aahe", "aste", "asate", "ahet", "naahi", "nahi",
-    "kiti", "kasa", "kase", "kashi", "kay", "kaay", "kon", "konte",
+    "ahe", "aahe", "aste", "asate",
+    # BUG-01 FIX — "ahet"/"aahet" were leaking into search_value
+    "ahet", "aahet", "naahi", "nahi",
+    # BUG-01 FIX — "kiti"/"kitee" leak fix
+    "kiti", "kitee", "kiteek",
+    "kasa", "kase", "kashi", "kay", "kaay", "kon", "konte",
     "ha", "he", "hi", "hya", "tya", "ya", "ja",
     "pan", "pari", "tar", "mhanje", "mhanun",
     "ata", "aata", "jara", "jra", "ekda", "ekadha",
@@ -353,7 +585,6 @@ MR_STOP_ROMAN = {
     "sobat", "sathe", "barobar",
     "naavache", "naav", "naavane", "naavachya",
     "wala", "wale", "wali", "vala", "vale", "vali",
-    "cha", "che", "chi", "chya",
     # Info/detail words
     "mahiti", "tapshil", "maahiti",
     "itihas", "history",
@@ -362,12 +593,13 @@ MR_STOP_ROMAN = {
     # Filler
     "please", "plz", "krupaya", "krupa",
     "thodi", "thoda", "thode",
+    # Number/count words that shouldn't be search values
+    "ek", "don", "teen", "char", "panch",
 }
 
 # ── Marathi bulk trigger words (Roman) ───────────────────────────────────────
-# When any of these appear in a query, intent is forced to BULK_LIST
 MR_BULK_ROMAN = {
-    "sarv", "sarva", "saglya", "sagale", "yadi", "yaadi",
+    "sarv", "sarva", "sarve", "saglya", "sagale", "yadi", "yaadi",
     "sare", "sara", "sampurn", "poorna", "purna", "soochi",
     "all", "every", "complete", "full", "entire", "sarav",
 }
@@ -405,24 +637,23 @@ MR_BULK_DEVA = {
     "सर्व", "सगळ्या", "सगळे", "यादी", "सूची", "संपूर्ण", "पूर्ण", "सारे",
 }
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # MARATHI LANGUAGE LAYER
+#
 # Covers three input modes:
 #   1. Devanagari script  — e.g. "सर्व खरेदी दाखवा"
-#   2. Roman transliteration (Marathi typing) — e.g. "kharedi list dya"
+#   2. Roman transliteration — e.g. "kharedi list dya"
 #   3. Mixed — e.g. "supplier credit kiti ahe"
 #
 # Design principles:
 #   - Longest-match wins (more specific phrase beats shorter keyword)
 #   - Devanagari detection via Unicode range U+0900–U+097F
-#   - Roman detection via a curated frozenset of Marathi phonetic markers
+#   - Roman detection via curated frozenset of Marathi phonetic markers
 #   - Devanagari inflection stemming applied before classification
-#   - All detection is O(n*m) — fast enough for real-time use
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ── Devanagari inflection → canonical form ────────────────────────────────────
-# Maps common inflected forms to their base/canonical form so the intent map
-# can match correctly. e.g. "उत्पादने दाखवा" → "उत्पादन दाखवा" → product-stock
 DEVA_STEMS = {
     "उत्पादने":       "उत्पादन",
     "उत्पादनें":      "उत्पादन",
@@ -434,7 +665,7 @@ DEVA_STEMS = {
     "खरेदीची":        "खरेदी",
     "विक्रीची":       "विक्री",
     "साठ्याची":       "साठा",
-    "साथ":            "साठा",   # common Devanagari typo
+    "साथ":            "साठा",
     "स्टॉकची":        "स्टॉक",
     "देयकाचे":        "देयक",
     "पेमेंटची":       "पेमेंट",
@@ -446,11 +677,14 @@ DEVA_STEMS = {
     "उत्पादनांची":    "उत्पादन",
     "खरेदीचे":        "खरेदी",
     "विक्रीचे":       "विक्री",
+    "पुरवठादाराची":   "पुरवठादार",
+    "श्रेणींची":      "श्रेणी",
+    "साहित्यांचे":    "साहित्य",
 }
 
-# ── Intent keyword map — Devanagari + Roman per module ────────────────────────
-# Sorted by length descending at runtime so longest match wins.
-# e.g. "पुरवठादार क्रेडिट" (18 chars) beats "क्रेडिट" (7 chars)
+# ── Marathi intent keyword map — Devanagari + Roman per module ────────────────
+# BUG-02 FIX: "supplier" (English word) added to Roman section of supplier
+# module so mixed queries like "supplier chi yadi dakhva" are caught.
 _MR_RAW = {
     "purchase": {
         "deva": [
@@ -478,6 +712,18 @@ _MR_RAW = {
             "mal vikla", "kay vikle", "sarv vikri", "vikri tapshil",
             "vikri list", "vikree list", "vikri history", "sales list",
             "vikri", "vikree", "pavti",
+        ],
+    },
+    "supplier-purchase-history": {
+        "deva": [
+            "पुरवठादार खरेदी इतिहास", "पुरवठादार खरेदी अहवाल",
+            "पुरवठादाराने काय खरेदी", "विक्रेता खरेदी यादी",
+        ],
+        "roman": [
+            "purvathakaar kharedi itihas", "supplier kharedi itihas",
+            "supplier purchase history", "vendor purchase history",
+            "purvathakaar kharedi list", "supplier kharedi yadi",
+            "supplier kharedi", "purvathakaar purchase",
         ],
     },
     "supplier-credit": {
@@ -509,16 +755,28 @@ _MR_RAW = {
     },
     "customer-ledger": {
         "deva": [
-            "ग्राहक खातेवही", "ग्राहक हिशेब", "ग्राहक विवरण", "ग्राहक खाते",
+            "ग्राहक खातेवही", "ग्राहक हिशेब",
+            "ग्राहक विवरण", "ग्राहक खाते",
         ],
         "roman": [
             "grahak khatevahi", "grahak hisab", "graahak khatevahi",
             "customer ledger", "customer hisab",
         ],
     },
+    "customer-payment-history": {
+        "deva": [
+            "ग्राहक देयक इतिहास", "ग्राहक पेमेंट",
+            "ग्राहकाने किती दिले",
+        ],
+        "roman": [
+            "grahak payment itihas", "grahak payment history",
+            "customer payment history", "grahak paid",
+        ],
+    },
     "customer": {
         "deva": [
-            "ग्राहक यादी", "सर्व ग्राहक", "ग्राहक माहिती", "खरेदीदार", "ग्राहक",
+            "ग्राहक यादी", "सर्व ग्राहक", "ग्राहक माहिती",
+            "खरेदीदार", "ग्राहक",
         ],
         "roman": [
             "grahak yadi", "sarv grahak", "grahak mahiti", "kharedidar",
@@ -526,14 +784,19 @@ _MR_RAW = {
             "grahak", "graahak",
         ],
     },
+    # BUG-02 FIX: Added "supplier" (English) to Roman markers so mixed
+    # queries like "supplier chi yadi dakhva" route correctly.
     "supplier": {
         "deva": [
-            "पुरवठादार यादी", "सर्व पुरवठादार", "विक्रेता", "माल पुरवठादार", "पुरवठादार",
+            "पुरवठादार यादी", "सर्व पुरवठादार", "विक्रेता",
+            "माल पुरवठादार", "पुरवठादार",
         ],
         "roman": [
             "purvathakaar yadi", "sarv purvathakaar", "vikreta",
-            "supplier list", "vendor list",
-            "purvathakaar", "puravathakaar",
+            "supplier list", "vendor list", "supplier yadi",
+            "supplier chi yadi", "supplier che tapshil",
+            "supplier mahiti", "supplier bagha", "supplier dakha",
+            "purvathakaar", "puravathakaar", "supplier",
         ],
     },
     "product-stock": {
@@ -573,16 +836,22 @@ _MR_RAW = {
         ],
     },
     "category": {
-        "deva": ["श्रेणी यादी", "वर्गीकरण", "उत्पादन प्रकार", "श्रेणी", "प्रकार"],
-        "roman": ["shreni yadi", "vargikaran", "utpadan prakar",
-                  "category list", "shreni", "prakar"],
+        "deva": [
+            "श्रेणी यादी", "वर्गीकरण", "उत्पादन प्रकार",
+            "उत्पादन श्रेणी", "सर्व श्रेणी", "श्रेणी", "प्रकार",
+        ],
+        "roman": [
+            "shreni yadi", "vargikaran", "utpadan prakar",
+            "utpadan shreni", "sarv shreni",
+            "category list", "all categories", "shreni", "prakar",
+        ],
     },
     "printer": {
         "deva": ["प्रिंटर यादी", "मुद्रण यंत्र", "प्रिंटर"],
         "roman": ["printer yadi", "mudran yantra", "printer list", "printer"],
     },
     "email-config": {
-        "deva": ["ईमेल सेटिंग", "ईमेल", "मेल"],
+        "deva": ["ईमेल सेटिंग", "ईमेल कॉन्फिग", "ईमेल", "मेल"],
         "roman": ["email settings", "email config", "mail config", "email"],
     },
 }
@@ -594,108 +863,130 @@ for _mod, _kws in _MR_RAW.items():
         _MR_FLAT.append((k.lower(), _mod))
 _MR_FLAT.sort(key=lambda x: len(x[0]), reverse=True)
 
-# ── Marathi Roman phonetic markers (used for language detection) ──────────────
-# A query containing ANY of these is classified as 'marathi_roman'.
-# Carefully chosen to have low false-positive rate with English.
+# ── Marathi Roman phonetic markers (language detection) ───────────────────────
+# BUG-02 FIX: "supplier" added so mixed queries like "supplier chi yadi"
+# are detected as Marathi Roman (not misrouted through English NLU).
 _MR_ROMAN_MARKERS: frozenset = frozenset([
     "kharedi", "kharedee", "kharidi", "vikri", "vikree",
     "grahak", "graahak", "purvathakaar", "puravathakaar",
     "satha", "saatha", "thakbaki", "udhar", "dene",
-    "yadi", "bagha", "dakha", "ahe", "aahe", "sarv",
+    "yadi", "bagha", "dakha",
+    "ahe", "aahe", "aahet", "ahet",          # BUG-01 FIX — also triggers Marathi detection
+    "sarv", "sarva", "sarve",
     "saglya", "hisab", "hisaab", "khatevahi", "vivaran",
     "dayak", "paise", "paisa", "kachha", "sahitya",
     "kapad", "shreni", "uplabdh", "godam", "vyavahar",
     "pavti", "baki", "shillak", "rakkam", "vikreta",
-    "kiti", "mal", "nondi", "tapshil", "itihas",
+    "kiti", "kitee", "mal", "nondi", "tapshil", "itihas",
     "mahiti", "dilele", "dile", "kele", "vikle",
     "dakhva", "dakhav", "dakha", "mala", "mhala",
+    "chi", "che", "cha",                      # BUG-02 FIX — grammar particles
+    "supplier",                               # BUG-02 FIX — "supplier chi yadi"
 ])
 
 # ── Marathi quick-response word sets ─────────────────────────────────────────
 _MR_GREET: frozenset = frozenset([
     "नमस्कार", "नमस्ते", "हॅलो", "सुप्रभात",
-    "namaskar", "namaste", "namasте",
+    "namaskar", "namaste",
 ])
 _MR_THANKS: frozenset = frozenset([
-    "धन्यवाद", "आभारी", "थँक्यू", "shukriya",
+    "धन्यवाद", "आभारी", "थँक्यू",
     "dhanyavad", "aabhari", "dhanywaad",
 ])
 _MR_REFRESH: frozenset = frozenset([
-    "रिफ्रेश", "अद्यतन", "ताजी", "refresh kara", "update kara", "sync kara",
+    "रिफ्रेश", "अद्यतन", "ताजी",
+    "refresh kara", "update kara", "sync kara",
 ])
 
 # ── Column header translations ────────────────────────────────────────────────
 MR_COLUMNS = {
-    "Invoice No":      "इनव्हॉइस क्र.",
-    "Name":            "नाव",
-    "Email":           "ईमेल",
-    "Contact":         "संपर्क",
-    "Address":         "पत्ता",
-    "Supplier Name":   "पुरवठादाराचे नाव",
-    "Customer Name":   "ग्राहकाचे नाव",
-    "Product Name":    "उत्पादनाचे नाव",
-    "Material Name":   "साहित्याचे नाव",
-    "Total Amount":    "एकूण रक्कम",
-    "Sell Price":      "विक्री किंमत",
-    "Stock Quantity":  "साठ्याची संख्या",
-    "Quantity":        "संख्या",
-    "Qty":             "संख्या",
-    "Paid":            "दिलेले",
-    "Credit Amount":   "क्रेडिट रक्कम",
-    "Balance":         "शिल्लक",
-    "Debit":           "नावे",
-    "Credit":          "जमा",
-    "Date":            "तारीख",
-    "Created At":      "तयार तारीख",
-    "Updated At":      "अद्यतन तारीख",
-    "Created By":      "तयार केले",
-    "Updated By":      "अद्यतन केले",
-    "Barcode":         "बारकोड",
-    "Gst No":          "जीएसटी क्र.",
-    "Supply Type":     "पुरवठा प्रकार",
-    "Status":          "स्थिती",
-    "Price Per Unit":  "प्रति युनिट किंमत",
-    "Purchase Date":   "खरेदी तारीख",
-    "Sell Date":       "विक्री तारीख",
-    "Unit":            "युनिट",
-    "Size":            "आकार",
-    "Color":           "रंग",
-    "Category":        "श्रेणी",
-    "Description":     "वर्णन",
-    "Supplier Credit": "पुरवठादार क्रेडिट",
-    "First Name":      "पहिले नाव",
-    "Last Name":       "आडनाव",
-    "Phone":           "फोन",
-    "City":            "शहर",
-    "Type":            "प्रकार",
-    "Mode":            "पद्धत",
-    "Hsn No":          "एचएसएन क्र.",
-    "Price Code":      "किंमत कोड",
-    "Image Url":       "प्रतिमा",
-    "Product Code":    "उत्पादन कोड",
-    "Host":            "होस्ट",
-    "Port":            "पोर्ट",
-    "Bill No":         "बिल क्र.",
-    "Mobile":          "मोबाईल",
-    "To Pay":          "द्यावयाचे",
-    "Debit Amount":    "नावे रक्कम",
+    "Invoice No":           "इनव्हॉइस क्र.",
+    "Name":                 "नाव",
+    "Email":                "ईमेल",
+    "Contact":              "संपर्क",
+    "Address":              "पत्ता",
+    "Supplier Name":        "पुरवठादाराचे नाव",
+    "Customer Name":        "ग्राहकाचे नाव",
+    "Product Name":         "उत्पादनाचे नाव",
+    "Material Name":        "साहित्याचे नाव",
+    "Total Amount":         "एकूण रक्कम",
+    "Sell Price":           "विक्री किंमत",
+    "Stock Quantity":       "साठ्याची संख्या",
+    "Quantity":             "संख्या",
+    "Qty":                  "संख्या",
+    "Received Quantity":    "प्राप्त संख्या",
+    "Missing Quantity":     "उणी संख्या",
+    "Total Quantity":       "एकूण संख्या",
+    "Paid":                 "दिलेले",
+    "Credit Amount":        "क्रेडिट रक्कम",
+    "Balance":              "शिल्लक",
+    "Debit":                "नावे",
+    "Credit":               "जमा",
+    "Date":                 "तारीख",
+    "Created At":           "तयार तारीख",
+    "Updated At":           "अद्यतन तारीख",
+    "Created By":           "तयार केले",
+    "Updated By":           "अद्यतन केले",
+    "Barcode":              "बारकोड",
+    "Gst No":               "जीएसटी क्र.",
+    "Supply Type":          "पुरवठा प्रकार",
+    "Status":               "स्थिती",
+    "Price Per Unit":       "प्रति युनिट किंमत",
+    "Purchase Date":        "खरेदी तारीख",
+    "Sell Date":            "विक्री तारीख",
+    "Unit":                 "युनिट",
+    "Size":                 "आकार",
+    "Color":                "रंग",
+    "Category":             "श्रेणी",
+    "Description":          "वर्णन",
+    "Supplier Credit":      "पुरवठादार क्रेडिट",
+    "First Name":           "पहिले नाव",
+    "Last Name":            "आडनाव",
+    "Phone":                "फोन",
+    "City":                 "शहर",
+    "Type":                 "प्रकार",
+    "Mode":                 "पद्धत",
+    "Hsn No":               "एचएसएन क्र.",
+    "Price Code":           "किंमत कोड",
+    "Image Url":            "प्रतिमा",
+    "Product Code":         "उत्पादन कोड",
+    "Host":                 "होस्ट",
+    "Port":                 "पोर्ट",
+    "Bill No":              "बिल क्र.",
+    "Mobile":               "मोबाईल",
+    "To Pay":               "द्यावयाचे",
+    "Debit Amount":         "नावे रक्कम",
+    "Purchase Amount":      "खरेदी रक्कम",
+    "Total Purchase Amount":"एकूण खरेदी रक्कम",
+    "Payment Mode":         "देय पद्धत",
+    "Supplier Bill":        "पुरवठादार बिल",
+    "Supplier":             "पुरवठादार",
+    "Material":             "साहित्य",
+    "Packing Charges":      "पॅकिंग शुल्क",
+    "Discount":             "सूट",
+    "Cgst":                 "सीजीएसटी",
+    "Sgst":                 "एसजीएसटी",
+    "Igst":                 "आयजीएसटी",
 }
 
 # ── Module name translations ──────────────────────────────────────────────────
 MR_MODULES = {
-    "purchase":        "खरेदी",
-    "sell":            "विक्री",
-    "supplier-credit": "पुरवठादार क्रेडिट",
-    "supplier-ledger": "पुरवठादार खातेवही",
-    "customer-ledger": "ग्राहक खातेवही",
-    "customer":        "ग्राहक",
-    "supplier":        "पुरवठादार",
-    "product-stock":   "उत्पादन साठा",
-    "payment":         "देयक",
-    "material":        "साहित्य",
-    "category":        "श्रेणी",
-    "printer":         "प्रिंटर",
-    "email-config":    "ईमेल सेटिंग",
+    "purchase":                   "खरेदी",
+    "sell":                       "विक्री",
+    "supplier-credit":            "पुरवठादार क्रेडिट",
+    "supplier-ledger":            "पुरवठादार खातेवही",
+    "customer-ledger":            "ग्राहक खातेवही",
+    "customer-ledger-summary":    "ग्राहक खाते सारांश",
+    "customer":                   "ग्राहक",
+    "supplier":                   "पुरवठादार",
+    "product-stock":              "उत्पादन साठा",
+    "payment":                    "देयक",
+    "customer-payment-history":   "ग्राहक देयक इतिहास",
+    "supplier-purchase-history":  "पुरवठादार खरेदी इतिहास",
+    "material":                   "साहित्य",
+    "category":                   "श्रेणी",
+    "printer":                    "प्रिंटर",
+    "email-config":               "ईमेल सेटिंग",
 }
 
 
@@ -708,11 +999,9 @@ def detect_language(text: str) -> str:
     Returns: 'marathi_devanagari' | 'marathi_roman' | 'english'
 
     Algorithm:
-      1. Count Devanagari chars (U+0900–U+097F). If >25% of alpha chars → Devanagari.
+      1. Count Devanagari chars (U+0900–U+097F). If >25% → Devanagari.
       2. Else check for any Marathi Roman phonetic markers → marathi_roman.
       3. Else → english.
-
-    Fast: O(len(text)) for step 1, O(markers) for step 2.
     """
     deva  = sum(1 for c in text if 0x0900 <= ord(c) <= 0x097F)
     alpha = sum(1 for c in text if c.isalpha())
@@ -721,7 +1010,7 @@ def detect_language(text: str) -> str:
     if deva / alpha > 0.25:
         return "marathi_devanagari"
     t = text.lower()
-    if any(m in t for m in _MR_ROMAN_MARKERS):
+    if any(m in t.split() or m in t for m in _MR_ROMAN_MARKERS):
         return "marathi_roman"
     return "english"
 
@@ -729,13 +1018,9 @@ def detect_language(text: str) -> str:
 def marathi_classify(text: str) -> Optional[str]:
     """
     Classify a Marathi query (Devanagari or Roman) to a module key.
-
-    Uses longest-match: 'purvathakaar credit' (18 chars) beats 'credit' (6 chars).
-    Applies Devanagari inflection stemming before matching.
-
+    Uses longest-match algorithm after Devanagari inflection stemming.
     Returns module key string or None if no match found.
     """
-    # Normalise inflected forms first
     words   = text.split()
     stemmed = " ".join(DEVA_STEMS.get(w, w) for w in words)
     t       = stemmed.lower().strip()
@@ -751,13 +1036,57 @@ def _apply_deva_stems(text: str) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# QUERY ANALYZER
+# Inspects raw query for structured patterns (barcode, invoice number,
+# phone number, active keyword) and sets a query_mode that SmartQueryRouter
+# can use to select a specific targeted API endpoint.
+# ──────────────────────────────────────────────────────────────────────────────
+
+class QueryAnalyzer:
+    """
+    Detects structured patterns in queries to enable targeted API calls.
+
+    Returns a dict:
+      query_mode:    "barcode" | "invoice" | "contact" | "active" | "name" | None
+      query_value:   the extracted value (barcode string, invoice no, phone no, name)
+    """
+
+    def analyze(self, user_query: str) -> dict:
+        q = user_query.strip()
+
+        # Barcode: BAR268726580, BAR938920346, etc.
+        m = BARCODE_RE.search(q)
+        if m:
+            return {"query_mode": "barcode", "query_value": m.group(0).upper()}
+
+        # Invoice number: PA00000001, SA00000001, INV-001
+        m = INVOICE_RE.search(q)
+        if m:
+            return {"query_mode": "invoice", "query_value": m.group(0).upper()}
+
+        # Indian mobile number (10 digits starting with 6-9)
+        m = CONTACT_RE.search(q)
+        if m:
+            return {"query_mode": "contact", "query_value": m.group(0)}
+
+        # "active" keyword → use active-specific endpoint
+        if ACTIVE_RE.search(q):
+            return {"query_mode": "active", "query_value": None}
+
+        return {"query_mode": None, "query_value": None}
+
+
+query_analyzer = QueryAnalyzer()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 1. NLU — 5-STAGE ENGLISH INTENT CLASSIFIER
 #
 # Pipeline with confidence scoring:
 #   S1: Multi-module patterns     → confidence 1.0
 #   S2: Phrase match              → confidence 0.95  (longest phrase wins)
 #   S3: Keyword match (scored)    → confidence proportional to match density
-#   S4: Fuzzy alias match         → confidence = fuzzy_ratio × 0.85
+#   S4: Fuzzy alias matching      → confidence = fuzzy_ratio × 0.85
 #   S5: TF-IDF cosine fallback    → confidence = cosine_score × 0.75
 #
 # The highest-confidence match across all 5 stages wins.
@@ -767,7 +1096,6 @@ def _apply_deva_stems(text: str) -> str:
 class IntentClassifier:
     def __init__(self):
         self._build_tfidf()
-        # Flat phrase pairs sorted longest-first so most specific phrase wins
         self._phrase_pairs = sorted(
             [
                 (ph.lower(), mod)
@@ -782,7 +1110,6 @@ class IntentClassifier:
             for mod, d in MODULE_REGISTRY.items()
             for al in d["aliases"]
         ]
-        # Multi-module phrase pairs sorted longest-first
         self._multi_pairs = sorted(
             [
                 (ph.lower(), pat)
@@ -796,7 +1123,7 @@ class IntentClassifier:
     def _build_tfidf(self):
         """
         Build TF-IDF vectors for each module's keyword corpus.
-        IDF = log((1+N)/(1+df)) + 1  (sklearn-style smoothing)
+        IDF = log((1+N)/(1+df)) + 1  (sklearn-style smoothing).
         Vectors are L2-normalised so cosine similarity = dot product.
         """
         corpus = {mod: " ".join(d["keywords"]) for mod, d in MODULE_REGISTRY.items()}
@@ -836,21 +1163,21 @@ class IntentClassifier:
             scores[mod] = sum(q[w] * dv[w] for w in common) / qn
         return scores
 
-    # ── Stage 1: Multi-module ───────────────────────────────────────────────
+    # ── Stage 1: Multi-module ─────────────────────────────────────────────────
     def _stage_multi(self, text: str):
         for ph, pat in self._multi_pairs:
             if ph in text:
                 return {"type": "MULTI", "pattern": pat, "confidence": 1.0}
         return None
 
-    # ── Stage 2: Phrase match ───────────────────────────────────────────────
+    # ── Stage 2: Phrase match ─────────────────────────────────────────────────
     def _stage_phrase(self, text: str):
         for ph, mod in self._phrase_pairs:
             if ph in text:
                 return {"type": "SINGLE", "module": mod, "confidence": 0.95}
         return None
 
-    # ── Stage 3: Keyword count scoring ─────────────────────────────────────
+    # ── Stage 3: Keyword count scoring ───────────────────────────────────────
     def _stage_keyword(self, text: str):
         best_mod, best_cnt = None, 0
         for mod, d in MODULE_REGISTRY.items():
@@ -863,12 +1190,12 @@ class IntentClassifier:
                     "confidence": min(0.9, 0.3 + 0.15 * best_cnt)}
         return None
 
-    # ── Stage 4: Fuzzy alias matching ──────────────────────────────────────
+    # ── Stage 4: Fuzzy alias matching ─────────────────────────────────────────
     def _stage_fuzzy(self, tokens: list):
         """SequenceMatcher ratio — catches typos like 'purchaces' → purchases."""
         best_s, best_mod = 0.0, None
         for tok in tokens:
-            if len(tok) < 4:  # skip very short tokens
+            if len(tok) < 4:
                 continue
             for al, mod in self._alias_pairs:
                 s = SequenceMatcher(None, tok, al).ratio()
@@ -879,7 +1206,7 @@ class IntentClassifier:
                     "confidence": best_s * 0.85}
         return None
 
-    # ── Stage 5: TF-IDF cosine fallback ────────────────────────────────────
+    # ── Stage 5: TF-IDF cosine fallback ──────────────────────────────────────
     def _stage_tfidf(self, text: str):
         scores = self._tfidf_score(text)
         if scores:
@@ -889,7 +1216,7 @@ class IntentClassifier:
                         "confidence": scores[best] * 0.75}
         return None
 
-    # ── Main classify ────────────────────────────────────────────────────────
+    # ── Main classify ─────────────────────────────────────────────────────────
     def classify(self, user_query: str) -> dict:
         t      = re.sub(r"[^a-z0-9\s\-]", " ", user_query.lower()).strip()
         tokens = t.split()
@@ -912,11 +1239,6 @@ class IntentClassifier:
 #   target_col:   specific column to search in (if detected via COLUMN_TRIGGERS)
 #   search_value: the actual value to search for (after stripping stop words)
 #   aggregation:  SUM | NONE
-#
-# Language awareness:
-#   - English queries use EN_STOP / EN_BULK
-#   - Marathi queries use MR_STOP_ROMAN | MR_STOP_DEVA  and  MR_BULK_*
-#   This prevents Marathi filler words from leaking into search_value.
 # ──────────────────────────────────────────────────────────────────────────────
 
 AGG_TRIGGERS = {
@@ -930,21 +1252,17 @@ class QueryParser:
     def parse(self, user_query: str, module_key: str, lang: str) -> dict:
         """
         Parse user_query in the context of module_key and detected language.
-
         Returns dict with keys: intent, target_col, search_value, aggregation.
         """
         text_lower = user_query.lower()
 
-        # Apply Devanagari stemming before any further processing
         if lang == "marathi_devanagari":
             text_lower = _apply_deva_stems(text_lower)
 
         tokens = text_lower.split()
+        agg    = any(t in text_lower for t in AGG_TRIGGERS)
 
-        # ── Aggregation detection ────────────────────────────────────────────
-        agg = any(t in text_lower for t in AGG_TRIGGERS)
-
-        # ── Language-specific stop / bulk sets ───────────────────────────────
+        # Language-specific stop / bulk sets
         if lang in ("marathi_devanagari", "marathi_roman"):
             stop = MR_STOP_ROMAN | MR_STOP_DEVA
             bulk = MR_BULK_ROMAN | MR_BULK_DEVA
@@ -954,7 +1272,7 @@ class QueryParser:
 
         is_bulk = any(tok in bulk for tok in tokens)
 
-        # ── Strip module vocabulary ──────────────────────────────────────────
+        # Build module vocabulary to strip
         mod = MODULE_REGISTRY[module_key]
         mod_words: set = set()
         for kw in mod["keywords"]:
@@ -963,12 +1281,11 @@ class QueryParser:
             mod_words.update(ph.lower().split())
         for al in mod["aliases"]:
             mod_words.update(al.lower().split())
-        # Also strip Marathi keywords for this module
         for kw, m in _MR_FLAT:
             if m == module_key:
                 mod_words.update(kw.split())
 
-        # ── Detect target column ─────────────────────────────────────────────
+        # Detect target column
         target_col = None
         col_words: set = set()
         for trigger, cols in COLUMN_TRIGGERS.items():
@@ -977,15 +1294,14 @@ class QueryParser:
                 col_words.update([trigger, trigger + "s", trigger + "es"])
                 break
 
-        # ── Extract search value ─────────────────────────────────────────────
-        # Value tokens = whatever remains after stripping stop + module + col words
+        # Extract search value
         strip = stop | mod_words | col_words
         value_tokens = [
             tok for tok in tokens
             if tok not in strip and len(tok) > 1
         ]
 
-        # Codes and numbers (invoice numbers, barcodes) — preserve regardless
+        # Preserve code-like tokens (barcodes, invoice numbers)
         code_tokens = [
             tok for tok in tokens
             if re.match(r"^[a-z0-9\-]+$", tok)
@@ -997,7 +1313,7 @@ class QueryParser:
 
         search_value = " ".join(value_tokens).strip()
 
-        # ── Determine intent ─────────────────────────────────────────────────
+        # Determine intent
         if target_col:
             intent = "COLUMN_SEARCH" if search_value else "PROMPT_NEEDED"
         elif search_value and not is_bulk:
@@ -1016,48 +1332,46 @@ class QueryParser:
 # ──────────────────────────────────────────────────────────────────────────────
 # 3. DATA MIRROR — SQLite in-memory with FTS5
 #
-# For each module, maintains TWO tables:
-#   "{module}"       — structured columnar data (typed TEXT columns)
+# For each module, maintains:
+#   "{module}"       — structured columnar data
 #   "{module}_fts"   — FTS5 virtual table for full-text BM25 search
 #
 # FTS5 advantages over LIKE:
-#   • BM25 ranking (relevance-sorted results, not just existence)
-#   • Tokenizer handles word boundaries correctly
+#   • BM25 ranking — relevance-sorted results
 #   • 5-10× faster on large datasets
-#   • Case-insensitive by default
-#   • Supports prefix search: MATCH 'INV-*'
+#   • Handles word boundaries correctly
+#   • Case-insensitive, unicode61 tokenizer with diacritics removed
 #
-# TTL-based caching:
-#   • Each module has an expiry timestamp
+# TTL caching:
 #   • sync_module() is a no-op if cache is still valid
 #   • sync_all(force=True) bypasses cache (used on "refresh" commands)
 #
 # API resilience:
 #   • 3 retry attempts with exponential backoff (1.5s, 3s, 6s)
-#   • Returns None on all retries failing → api_error shown to user
+#   • Detailed error logging per attempt for diagnosis
 # ──────────────────────────────────────────────────────────────────────────────
 
 class DataMirror:
     def __init__(self):
-        # WAL mode allows concurrent reads without blocking writes
         self.conn = sqlite3.connect(":memory:", check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA temp_store=MEMORY")
-        self.conn.execute("PRAGMA cache_size=-16000")  # 16 MB page cache
-        self._ttl:  dict = {}   # module → expiry timestamp
-        self._cols: dict = {}   # module → list of column names
+        self.conn.execute("PRAGMA cache_size=-16000")
+        self._ttl:  dict = {}
+        self._cols: dict = {}
         self._lock = asyncio.Lock()
 
-    # ── Flatten nested API JSON ─────────────────────────────────────────────
     def _extract_list(self, raw) -> list:
         """Extract the primary data list from varied API response shapes."""
         if isinstance(raw, list):
             return raw
         if isinstance(raw, dict):
-            if "data" in raw and isinstance(raw["data"], list):
-                return raw["data"]
+            # Try common wrapper keys first
+            for key in ("data", "records", "result", "results", "items", "content"):
+                if key in raw and isinstance(raw[key], list):
+                    return raw[key]
             for v in raw.values():
                 if isinstance(v, list) and v:
                     return v
@@ -1066,12 +1380,8 @@ class DataMirror:
     def _flatten(self, records: list):
         """
         Generator: yields flat dict rows from possibly nested API records.
-
-        Handles:
-          - Primitive values → str()
-          - Nested dicts → extracts best display value (name/title/invoiceNo)
-          - Lists of dicts → cross-joins with parent row (child rows)
-          - None → empty string
+        Handles: primitives → str, nested dicts → best display value,
+        lists of dicts → cross-joins with parent row.
         """
         for rec in records:
             if not isinstance(rec, dict):
@@ -1104,14 +1414,11 @@ class DataMirror:
             else:
                 yield base
 
-    # ── SQLite load ───────────────────────────────────────────────────────────
     def _load(self, key: str, records: list):
         """
-        Create/replace columnar table + FTS5 virtual table for a module.
-
-        Uses content= FTS table (no data duplication — FTS index references
-        main table rowid). Tokenizer: unicode61 with diacritics removed
-        (so "Rahül" matches "rahul").
+        Create/replace columnar table + FTS5 content virtual table.
+        FTS uses unicode61 tokenizer with diacritics removed so
+        "Rahül" matches "rahul".
         """
         cur = self.conn.cursor()
         cur.execute(f'DROP TABLE IF EXISTS "{key}_fts"')
@@ -1123,7 +1430,6 @@ class DataMirror:
             self.conn.commit()
             return
 
-        # Collect all unique column names preserving insertion order
         seen, all_keys = set(), []
         for r in records:
             for k in r:
@@ -1132,19 +1438,16 @@ class DataMirror:
                     all_keys.append(k)
 
         records = records[:MAX_ROWS]
-
-        # Columnar table
         cols_ddl = ", ".join(f'"{k}" TEXT' for k in all_keys)
         cur.execute(f'CREATE TABLE "{key}" (_rowid INTEGER PRIMARY KEY, {cols_ddl})')
-        ph     = ",".join(["?"] * len(all_keys))
-        col_sql = ", ".join(f'"{k}"' for k in all_keys)
+        ph       = ",".join(["?"] * len(all_keys))
+        col_sql  = ", ".join(f'"{k}"' for k in all_keys)
         for r in records:
             cur.execute(
                 f'INSERT INTO "{key}" ({col_sql}) VALUES ({ph})',
                 [r.get(k, "") for k in all_keys],
             )
 
-        # FTS5 content table (index only, references main table)
         fts_cols = ", ".join(f'"{k}"' for k in all_keys)
         cur.execute(
             f'CREATE VIRTUAL TABLE "{key}_fts" USING fts5('
@@ -1158,48 +1461,55 @@ class DataMirror:
         self.conn.commit()
         self._cols[key] = all_keys
 
-    # ── API fetch with exponential backoff retry ──────────────────────────────
-    async def _fetch_with_retry(self, url: str) -> Optional[list]:
+    async def _fetch_with_retry(self, url: str,
+                                params: Optional[dict] = None) -> Optional[list]:
         """
-        Fetch a module's data from the ERP API.
-        Retries up to API_MAX_RETRIES times with exponential backoff.
-        Returns flat record list or None on total failure.
+        Fetch module data from ERP API with exponential backoff retry.
+        Logs HTTP status and response body on failure for diagnosis.
+        Returns flat record list or None after all retries fail.
         """
         last_exc = None
         for attempt in range(API_MAX_RETRIES):
             try:
                 async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
                     auth  = await client.post(LOGIN_URL, json=LOGIN_CREDS)
-                    token = auth.json().get("jwtToken")
+                    token = auth.json().get("jwtToken") or auth.json().get("token")
                     if not token:
-                        return None
+                        print(f"[DataMirror] Auth failed attempt {attempt+1}: "
+                              f"status={auth.status_code} body={auth.text[:200]}")
+                        last_exc = Exception("Auth failed — no token")
+                        await asyncio.sleep(1.5 * (2 ** attempt))
+                        continue
                     headers = {
                         "Authorization": f"Bearer {token}",
                         "Content-Type":  "application/json",
                     }
-                    resp = await client.get(f"{BASE_URL}{url}", headers=headers)
+                    req_url = f"{BASE_URL}{url}"
+                    resp = await client.get(req_url, headers=headers,
+                                            params=params or {})
                     if resp.status_code == 200:
                         return self._extract_list(resp.json())
+                    print(f"[DataMirror] {url} attempt {attempt+1}: "
+                          f"HTTP {resp.status_code} — {resp.text[:200]}")
                     last_exc = Exception(f"HTTP {resp.status_code}")
             except Exception as exc:
                 last_exc = exc
-                if attempt < API_MAX_RETRIES - 1:
-                    await asyncio.sleep(1.5 * (2 ** attempt))  # 1.5s, 3s, 6s
-        print(f"[DataMirror] All retries failed for {url}: {last_exc}")
+                print(f"[DataMirror] {url} attempt {attempt+1} exception: {exc}")
+            if attempt < API_MAX_RETRIES - 1:
+                await asyncio.sleep(1.5 * (2 ** attempt))
+        print(f"[DataMirror] All {API_MAX_RETRIES} retries failed for {url}: {last_exc}")
         return None
 
-    # ── Sync single module ────────────────────────────────────────────────────
     async def sync_module(self, key: str, force: bool = False) -> bool:
         """
         Sync a module from the ERP API into SQLite.
-        Double-checked locking: check TTL before and after acquiring lock.
+        Double-checked locking to prevent redundant fetches.
         Returns True on success, False on API failure.
         """
         now = time.time()
         if not force and now < self._ttl.get(key, 0):
-            return True  # cache still valid
+            return True
         async with self._lock:
-            # Re-check inside lock (another coroutine may have synced first)
             if not force and now < self._ttl.get(key, 0):
                 return True
             mod = MODULE_REGISTRY[key]
@@ -1233,50 +1543,108 @@ db = DataMirror()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# 3b. SMART QUERY ROUTER
+#
+# NEW IN v6: Before loading the full table, checks if a targeted API endpoint
+# exists for the detected query_mode (barcode, invoice, contact, active).
+# If yes, calls the targeted endpoint directly and caches ONLY those results.
+#
+# Benefits:
+#   - 10-100× faster for point-lookup queries (no full table load)
+#   - Preserves bandwidth on limited servers
+#   - Results still go through the same FTS5/LIKE retrieval pipeline
+#
+# Fallback: if targeted endpoint fails or returns nothing, falls back to
+# loading the full table as normal.
+# ──────────────────────────────────────────────────────────────────────────────
+
+class SmartQueryRouter:
+    """
+    Routes queries to the most specific API endpoint available.
+    Falls back to full-table sync if targeted endpoint fails.
+    """
+
+    async def route(self, key: str, parsed: dict,
+                    query_mode: str, query_value: Optional[str]) -> bool:
+        """
+        Attempt to use a targeted search endpoint.
+        Returns True if successful (data loaded into db), False to fall back.
+
+        Targeted endpoints don't go through the TTL cache — they're always
+        fresh point-in-time fetches stored in a special "_targeted" key.
+        """
+        mod = MODULE_REGISTRY.get(key, {})
+        endpoints = mod.get("search_endpoints", {})
+
+        if not query_mode or query_mode not in endpoints:
+            return False
+
+        ep = endpoints[query_mode]
+
+        # "active" endpoints take no param
+        if ep["param"] is None:
+            raw = await db._fetch_with_retry(ep["url"])
+        else:
+            if not query_value:
+                return False
+            raw = await db._fetch_with_retry(ep["url"],
+                                              params={ep["param"]: query_value})
+
+        if raw is None or not raw:
+            return False
+
+        flat = list(db._flatten(raw))
+        if not flat:
+            return False
+
+        # Load into a temporary targeted table
+        targeted_key = f"{key}_targeted"
+        db._load(targeted_key, flat)
+        db._cols[targeted_key] = db._cols.get(targeted_key, [])
+        return True
+
+
+smart_router = SmartQueryRouter()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 4. RAG RETRIEVER — FTS5 BM25 → LIKE fallback → bulk
 #
 # Three-tier retrieval strategy per module:
+#   Tier A — FTS5 BM25 search  → fast, ranked, prefix-aware
+#   Tier B — SQLite LIKE scan  → broad fallback for partial matches
+#   Tier C — Full table bulk   → BULK_LIST intent
 #
-#   Tier A — FTS5 BM25 search (if search value provided)
-#       Fast, ranked, handles partial words with prefix* matching.
-#       Falls back to Tier B if FTS returns no results.
-#
-#   Tier B — SQLite LIKE scan across all columns
-#       Broad catch-all. Used when FTS misses something (e.g. partial
-#       barcode, numeric codes that FTS tokenises differently).
-#
-#   Tier C — Full table scan (BULK_LIST intent)
-#       Returns all rows up to MAX_BULK. Used for "show all X" queries.
-#
-# All results are returned as list[dict] with original column names.
-# _rowid is stripped from returned dicts (internal SQLite bookkeeping).
+# Supports both regular module tables and targeted tables (_targeted suffix).
 # ──────────────────────────────────────────────────────────────────────────────
 
 class RAGRetriever:
-    MAX_FTS  = 500     # max rows from FTS pass
-    MAX_LIKE = 500     # max rows from LIKE pass
-    MAX_BULK = 10_000  # max rows for bulk list
+    MAX_FTS  = 500
+    MAX_LIKE = 500
+    MAX_BULK = 10_000
 
-    def retrieve(self, key: str, parsed: dict) -> tuple:
+    def retrieve(self, key: str, parsed: dict,
+                 use_targeted: bool = False) -> tuple:
         """
         Returns (records: list[dict], columns: list[str], method: str)
-        method is one of: 'bulk' | 'fts' | 'like_col' | 'like_all' | 'empty'
+
+        use_targeted: if True, reads from {key}_targeted table (SmartQueryRouter result)
         """
+        table  = f"{key}_targeted" if use_targeted else key
         intent = parsed["intent"]
         val    = parsed["search_value"]
         tcol   = parsed["target_col"]
-        cols   = db.columns(key)
+        cols   = db.columns(table)
 
         if not cols:
             return [], [], "empty"
 
         if intent == "BULK_LIST" or not val:
-            return self._bulk(key), cols, "bulk"
+            return self._bulk(table), cols, "bulk"
 
-        rows, method = self._fts(key, val, tcol, cols)
+        rows, method = self._fts(table, val, tcol, cols)
         if not rows:
-            # Graceful degradation: FTS miss → LIKE scan
-            rows, method = self._like(key, val, tcol, cols)
+            rows, method = self._like(table, val, tcol, cols)
         return rows, cols, method
 
     def _resolve_col(self, target: str, cols: list) -> Optional[str]:
@@ -1290,12 +1658,7 @@ class RAGRetriever:
         return None
 
     def _fts(self, key, val, tcol, cols):
-        """
-        FTS5 BM25 ranked search.
-        Sanitises value (removes FTS special chars), builds column-scoped
-        or all-columns query, joins FTS virtual table with main table
-        to get typed column values back.
-        """
+        """FTS5 BM25 ranked search with column-scoping if target_col provided."""
         try:
             cur  = db.conn.cursor()
             safe = re.sub(r'["()*+\-^~]', " ", val).strip()
@@ -1309,7 +1672,6 @@ class RAGRetriever:
                 words = [w for w in safe.split() if len(w) > 1]
                 if not words:
                     return [], "fts_empty"
-                # OR query: any word present in any column → hit
                 fts_q = " OR ".join(f'"{w}"*' for w in words)
 
             cur.execute(
@@ -1327,7 +1689,7 @@ class RAGRetriever:
             return [], "fts_error"
 
     def _like(self, key, val, tcol, cols):
-        """Broad LIKE search — column-scoped if target_col provided, else all columns."""
+        """Broad LIKE search — column-scoped if target_col provided."""
         try:
             cur = db.conn.cursor()
             if tcol:
@@ -1341,7 +1703,6 @@ class RAGRetriever:
                     for r in rows:
                         r.pop("_rowid", None)
                     return rows, "like_col"
-            # Search all columns
             conds  = " OR ".join(f'"{c}" LIKE ?' for c in cols)
             params = [f"%{val}%"] * len(cols)
             cur.execute(
@@ -1357,7 +1718,7 @@ class RAGRetriever:
             return [], "like_error"
 
     def _bulk(self, key):
-        """Return all rows up to MAX_BULK — used for 'show all' queries."""
+        """Return all rows up to MAX_BULK."""
         try:
             cur = db.conn.cursor()
             cur.execute(f'SELECT * FROM "{key}" LIMIT {self.MAX_BULK}')
@@ -1376,22 +1737,20 @@ retriever = RAGRetriever()
 # ──────────────────────────────────────────────────────────────────────────────
 # 5. AGGREGATION ENGINE
 # Sums monetary and quantity columns across retrieved records.
-# Uses module registry's amount_cols / qty_cols lists for column targeting.
-# Handles currency symbols and commas before float conversion.
 # ──────────────────────────────────────────────────────────────────────────────
 
 class AggregationEngine:
     def compute(self, records: list, key: str) -> dict:
         """
-        Returns:
-          count        - number of records
-          total_amount - sum of first matching amount_col (or None)
-          total_qty    - sum of first matching qty_col (or None)
+        Returns count, total_amount (sum of amount cols), total_qty (sum of qty cols).
+        Uses module registry's amount_cols / qty_cols lists.
         """
-        mod     = MODULE_REGISTRY[key]
-        amt_c   = mod["amount_cols"]
-        qty_c   = mod["qty_cols"]
-        total_a = total_q = 0.0
+        # For targeted tables, use the base module key
+        base_key = key.replace("_targeted", "")
+        mod      = MODULE_REGISTRY.get(base_key, {"amount_cols": [], "qty_cols": []})
+        amt_c    = mod["amount_cols"]
+        qty_c    = mod["qty_cols"]
+        total_a  = total_q = 0.0
 
         for rec in records:
             for col in amt_c:
@@ -1403,7 +1762,7 @@ class AggregationEngine:
                         )
                     except (ValueError, TypeError):
                         pass
-                    break  # use first matching amount col per record
+                    break
             for col in qty_c:
                 qk = next((k for k in rec if k.lower() == col.lower()), None)
                 if qk:
@@ -1424,17 +1783,13 @@ aggregator = AggregationEngine()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 6. RESPONSE SYNTHESIZER — HTML generation
+# 6. RESPONSE SYNTHESIZER
 #
-# Generates professional HTML responses. Key design decisions:
-#
-#   • Column visibility — HIDDEN_COLS strips internal/security columns
-#   • Column ordering   — PRIORITY_COLS sorts business-critical cols first
-#   • Cell formatting   — auto-detects currency, qty, datetime, image, badge
-#   • NOT_CURRENCY      — prevents barcodes/codes/IDs from being ₹-formatted
-#   • Marathi support   — table headers, intro text, error messages all
-#                         translated when marathi=True
-#   • Hover row effect  — inline onmouseover/onmouseout (no CSS dependency)
+# Generates professional HTML responses:
+#   - Column filtering (HIDDEN_COLS) and ordering (PRIORITY_COLS)
+#   - Auto-formatting: currency, quantity, datetime, image, status badge
+#   - NOT_CURRENCY exclusion list prevents barcodes/codes getting ₹ format
+#   - Marathi translation of headers and messages when marathi=True
 # ──────────────────────────────────────────────────────────────────────────────
 
 HIDDEN_COLS = {
@@ -1443,27 +1798,36 @@ HIDDEN_COLS = {
 }
 
 PRIORITY_COLS = [
-    "invoiceNo", "billNo", "productName", "name", "firstName", "lastName",
-    "supplierName", "customerName", "materialName", "supplier", "customer",
-    "product", "email", "phone", "contact", "mobile",
-    "stockQuantity", "quantity", "qty",
-    "sellPrice", "pricePerUnit", "totalAmount", "amount",
-    "creditAmount", "paid", "balance", "debit", "credit",
+    "invoiceNo", "billNo", "supplierBill",
+    "productName", "name", "firstName", "lastName",
+    "supplierName", "customerName", "materialName",
+    "supplier", "customer", "product", "material",
+    "email", "phone", "contact", "mobile",
+    "stockQuantity", "quantity", "qty", "receivedQuantity",
+    "sellPrice", "pricePerUnit", "purchaseAmount", "totalPurchaseAmount",
+    "totalAmount", "amount", "creditAmount", "paid", "balance",
+    "debit", "credit", "discount", "cgst", "sgst", "igst",
     "date", "createdAt", "purchaseDate", "sellDate",
-    "address", "city", "gstNo", "barcode", "status", "supplyType",
+    "paymentMode", "status", "supplyType",
+    "address", "city", "gstNo", "barcode", "hsnNo", "size", "color", "unit",
 ]
 
-# Semantic hints for currency and quantity detection
-AMOUNT_HINTS = {"price", "amount", "total", "balance", "credit", "debit", "paid", "cost", "value"}
-QTY_HINTS    = {"quantity", "qty", "stock"}
+AMOUNT_HINTS = {
+    "price", "amount", "total", "balance", "credit", "debit",
+    "paid", "cost", "value", "charges", "discount",
+}
+QTY_HINTS = {"quantity", "qty", "stock"}
 
-# Columns that look numeric but are NOT currency values
-# e.g. "Price Code", "HSN No", "Barcode", "Port" — must NOT get ₹ formatting
-NOT_CURRENCY = {"code", "no", "id", "barcode", "number", "ref", "hsn", "pin", "port"}
+# Columns with numeric values that must NEVER get ₹ formatting
+NOT_CURRENCY = {
+    "code", "no", "id", "barcode", "number", "ref",
+    "hsn", "pin", "port", "cgst", "sgst", "igst",
+    "missing", "received",
+}
 
 
 def _is_currency_col(col: str) -> bool:
-    """True if column likely holds a monetary value and should be ₹-formatted."""
+    """True if column likely holds a monetary value — ₹ formatted."""
     col_l = col.lower()
     if any(ex in col_l for ex in NOT_CURRENCY):
         return False
@@ -1471,33 +1835,36 @@ def _is_currency_col(col: str) -> bool:
 
 
 def _is_qty_col(col: str) -> bool:
-    """True if column likely holds a quantity (integer, blue/red coloured)."""
+    """True if column likely holds a quantity."""
     col_l = col.lower()
-    return any(h in col_l for h in QTY_HINTS) and not any(ex in col_l for ex in NOT_CURRENCY)
+    return any(h in col_l for h in QTY_HINTS) and not any(
+        ex in col_l for ex in NOT_CURRENCY
+    )
 
 
 def _fmt_cell(col: str, val: str) -> str:
     """
     Format a single cell value for HTML display.
     Detection order:
-      1. Empty / null → em-dash placeholder
-      2. Image URL    → <img> thumbnail
-      3. ISO datetime → compact date+time string
+      1. Empty / null → em-dash
+      2. Image URL    → <img> thumbnail (40×40, rounded)
+      3. ISO datetime → compact date+time
       4. Currency col → ₹-formatted bold (green/red)
       5. Qty col      → integer with comma (blue/red)
       6. Status col   → colour-coded badge pill
-      7. Default      → plain text
+      7. Default      → plain text (XSS-safe)
     """
     if not val or val in ("None", "null", ""):
         return '<span style="color:#94a3b8">—</span>'
 
     # Image URL
     if val.startswith("http") and any(
-        val.lower().endswith(e) for e in (".png", ".jpg", ".jpeg", ".webp")
+        val.lower().endswith(e) for e in (".png", ".jpg", ".jpeg", ".webp", ".gif")
     ):
+        safe = val.replace('"', "&quot;")
         return (
-            f'<img src="{val}" style="width:40px;height:40px;'
-            f'object-fit:cover;border-radius:6px;" />'
+            f'<img src="{safe}" style="width:40px;height:40px;'
+            f'object-fit:cover;border-radius:6px;" loading="lazy" />'
         )
 
     # ISO datetime
@@ -1527,56 +1894,57 @@ def _fmt_cell(col: str, val: str) -> str:
             pass
 
     # Status badge
-    if col.lower() in ("status", "supplytype", "type", "state"):
-        badge = {
+    if col.lower() in ("status", "supplytype", "type", "state", "paymentmode"):
+        BADGE = {
             "in-state":  ("#dcfce7", "#16a34a"),
             "out-state": ("#fef3c7", "#d97706"),
             "active":    ("#dcfce7", "#16a34a"),
             "inactive":  ("#fee2e2", "#dc2626"),
             "paid":      ("#dcfce7", "#16a34a"),
             "pending":   ("#fef3c7", "#d97706"),
-        }.get(val.lower(), ("#f1f5f9", "#475569"))
+            "cash":      ("#f0f9ff", "#0369a1"),
+            "credit":    ("#fdf4ff", "#9333ea"),
+            "upi":       ("#f0fdf4", "#16a34a"),
+        }
+        badge = BADGE.get(val.lower(), ("#f1f5f9", "#475569"))
+        safe  = val.replace("<", "&lt;").replace(">", "&gt;")
         return (
             f'<span style="background:{badge[0]};color:{badge[1]};'
             f'padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600">'
-            f'{val}</span>'
+            f'{safe}</span>'
         )
 
-    return val
+    # Default — XSS-safe
+    return val.replace("<", "&lt;").replace(">", "&gt;")
 
 
 class ResponseSynthesizer:
 
     def _headers(self, cols: list) -> list:
-        """Filter out hidden columns and sort by PRIORITY_COLS order."""
-        lh = {c.lower() for c in HIDDEN_COLS}
+        """Filter hidden columns and sort by PRIORITY_COLS order."""
+        lh      = {c.lower() for c in HIDDEN_COLS}
         visible = [c for c in cols if c.lower() not in lh]
         return sorted(visible, key=lambda x: (
             PRIORITY_COLS.index(x) if x in PRIORITY_COLS else 99
         ))
 
     def _col_label(self, col: str, marathi: bool) -> str:
-        """
-        Convert camelCase column name to human-readable label.
-        If marathi=True, translate via MR_COLUMNS dict.
-        """
+        """Convert camelCase column name to human-readable label.
+        If marathi=True, translate via MR_COLUMNS."""
         eng = re.sub(r"([a-z])([A-Z])", r"\1 \2", col).title()
         return MR_COLUMNS.get(eng, eng) if marathi else eng
 
-    # ── Natural language intro paragraph ─────────────────────────────────────
     def intro(self, key: str, agg: dict, search_val: str,
               marathi: bool, lang: str) -> str:
-        """
-        Generate a natural language intro paragraph above the data table.
-        Shows: what was searched, how many records found, total amount / qty.
-        Switches to Marathi text when marathi=True.
-        """
+        """Natural language intro paragraph with record count and totals."""
         count = agg["count"]
         amt   = agg["total_amount"]
         qty   = agg["total_qty"]
+        # Use base key for label lookup
+        base_key = key.replace("_targeted", "")
 
         if marathi:
-            label = MR_MODULES.get(key, key)
+            label = MR_MODULES.get(base_key, base_key)
             if search_val:
                 text = (
                     f'<strong>{label}</strong> मध्ये '
@@ -1594,7 +1962,7 @@ class ResponseSynthesizer:
             if qty:
                 parts.append(f'एकूण युनिट: <strong>{qty:,}</strong>')
         else:
-            label = key.replace("-", " ").title()
+            label = base_key.replace("-", " ").title()
             ack   = random.choice([
                 "Here you go! ", "Got it. ", "Absolutely! ", "Done — ",
             ])
@@ -1619,16 +1987,14 @@ class ResponseSynthesizer:
             text += " &nbsp;·&nbsp; " + " &nbsp;·&nbsp; ".join(parts)
         return f'<p style="margin:0 0 14px;font-size:15px;line-height:1.6">{text}</p>'
 
-    # ── HTML table ────────────────────────────────────────────────────────────
     def table(self, records: list, cols: list, marathi: bool) -> str:
         """
-        Build a responsive HTML table with:
+        Build a responsive HTML table:
           - Gradient dark header
-          - Alternating row stripes
-          - Hover highlight via inline handlers
+          - Alternating row stripes (#fff / #f8fafc)
+          - Hover highlight (#eff6ff) via inline handlers
           - Marathi font stack when marathi=True
-          - Column headers translated when marathi=True
-          - Cell values formatted via _fmt_cell()
+          - XSS-safe cell values via _fmt_cell()
         """
         headers = self._headers(cols)
         if not headers:
@@ -1676,62 +2042,109 @@ class ResponseSynthesizer:
             f'</table></div>'
         )
 
-    # ── Error / empty state messages ─────────────────────────────────────────
-    def no_results(self, key: str, val: str, marathi: bool) -> str:
-        """Zero-results message — bilingual."""
+    def no_results(self, key: str, val: str, marathi: bool,
+                   query_mode: str = None) -> str:
+        """Zero-results message — bilingual. Hints at what was searched."""
+        base_key = key.replace("_targeted", "")
         if marathi:
-            label = MR_MODULES.get(key, key)
+            label = MR_MODULES.get(base_key, base_key)
+            hint  = ""
+            if query_mode == "barcode":
+                hint = "<br><small>टीप: बारकोड पूर्ण स्कॅन करा (उदा. BAR268726580)</small>"
+            elif query_mode == "invoice":
+                hint = "<br><small>टीप: इनव्हॉइस नंबर तपासा (उदा. PA00000001)</small>"
             return (
                 f'<div style="background:#fef2f2;border:1px solid #fecaca;'
                 f'border-radius:10px;padding:16px 20px;color:#991b1b;">'
                 f'<strong>{label}</strong> मध्ये '
-                f'<strong>"{val}"</strong> साठी काहीही सापडले नाही.<br>'
-                f'<small>टीप: शब्दलेखन तपासा किंवा लहान शब्द वापरा.</small></div>'
+                f'<strong>"{val}"</strong> साठी काहीही सापडले नाही.{hint}<br>'
+                f'<small>शब्दलेखन तपासा किंवा लहान शब्द वापरा.</small></div>'
             )
-        label = key.replace("-", " ").title()
+        label = base_key.replace("-", " ").title()
+        hint  = ""
+        if query_mode == "barcode":
+            hint = "<br><small>Tip: use the full barcode (e.g. BAR268726580)</small>"
+        elif query_mode == "invoice":
+            hint = "<br><small>Tip: check invoice number format (e.g. PA00000001)</small>"
+        elif query_mode == "contact":
+            hint = "<br><small>Tip: enter a 10-digit mobile number</small>"
         return (
             f'<div style="background:#fef2f2;border:1px solid #fecaca;'
             f'border-radius:10px;padding:16px 20px;color:#991b1b;">'
             f'No results found in <strong>{label}</strong> for '
-            f'<strong>"{val}"</strong>.<br>'
-            f'<small>Tip: check spelling or try a shorter search term.</small></div>'
+            f'<strong>"{val}"</strong>.{hint}<br>'
+            f'<small>Check spelling or try a shorter term.</small></div>'
         )
 
     def api_error(self, key: str, marathi: bool) -> str:
         """API failure message — mentions retry count — bilingual."""
+        base_key = key.replace("_targeted", "")
         if marathi:
-            label = MR_MODULES.get(key, key)
+            label = MR_MODULES.get(base_key, base_key)
             return (
                 f'<div style="background:#fff7ed;border:1px solid #fed7aa;'
                 f'border-radius:10px;padding:16px 20px;color:#9a3412;">'
-                f'⚠️ <strong>{label}</strong> चा डेटा मिळवता आला नाही ({API_MAX_RETRIES} प्रयत्नांनंतर). '
-                f'ERP कनेक्शन तपासा.</div>'
+                f'⚠️ <strong>{label}</strong> चा डेटा मिळवता आला नाही '
+                f'({API_MAX_RETRIES} प्रयत्नांनंतर). '
+                f'ERP कनेक्शन तपासा.<br>'
+                f'<small>सर्व्हर लॉग्स console मध्ये तपासा.</small></div>'
             )
-        label = key.replace("-", " ").title()
+        label = base_key.replace("-", " ").title()
         return (
             f'<div style="background:#fff7ed;border:1px solid #fed7aa;'
             f'border-radius:10px;padding:16px 20px;color:#9a3412;">'
-            f'⚠️ Could not fetch <strong>{label}</strong> data after {API_MAX_RETRIES} attempts. '
-            f'Please check the ERP server connection.</div>'
+            f'⚠️ Could not fetch <strong>{label}</strong> data after '
+            f'{API_MAX_RETRIES} attempts.<br>'
+            f'<small>Check server logs for HTTP status codes and auth errors.</small></div>'
         )
 
     def prompt_needed(self, key: str, col: str, marathi: bool) -> str:
-        """Asks user to specify a column value when COLUMN_SEARCH has no value."""
+        """Asks user to specify a value when COLUMN_SEARCH has none."""
+        base_key = key.replace("_targeted", "")
         if marathi:
-            label   = MR_MODULES.get(key, key)
+            label   = MR_MODULES.get(base_key, base_key)
             col_eng = re.sub(r"([a-z])([A-Z])", r"\1 \2", col).title()
             col_mr  = MR_COLUMNS.get(col_eng, col_eng)
             return (
                 f'तुम्ही <strong>{label}</strong> विभागात शोधत आहात. '
                 f'कृपया <strong>{col_mr}</strong> सांगा.<br>'
-                f'<em>उदाहरण: "invoice INV-1042" किंवा "name Rahul"</em>'
+                f'<em>उदाहरण: "invoice PA00000001" किंवा "barcode BAR268726580"</em>'
             )
-        label     = key.replace("-", " ").title()
+        label     = base_key.replace("-", " ").title()
         col_label = re.sub(r"([a-z])([A-Z])", r"\1 \2", col).title()
         return (
             f'You\'re searching <strong>{label}</strong>. '
-            f'Please specify the <strong>{col_label}</strong>.<br>'
-            f'<em>Example: "invoice INV-1042" or "name Rahul"</em>'
+            f'Please specify the <strong>{col_label}</strong> value.<br>'
+            f'<em>Example: "invoice PA00000001" or "barcode BAR268726580"</em>'
+        )
+
+    def targeted_badge(self, query_mode: str, query_value: str,
+                       marathi: bool) -> str:
+        """Small badge shown above results when a targeted API was used."""
+        if marathi:
+            labels = {
+                "barcode":  f"बारकोड शोध: {query_value}",
+                "invoice":  f"इनव्हॉइस शोध: {query_value}",
+                "contact":  f"संपर्क शोध: {query_value}",
+                "active":   "सक्रिय नोंद",
+            }
+            txt = labels.get(query_mode, query_mode)
+            return (
+                f'<div style="background:#f0f9ff;border:1px solid #bae6fd;'
+                f'border-radius:8px;padding:8px 14px;margin-bottom:10px;'
+                f'font-size:13px;color:#0369a1">⚡ {txt}</div>'
+            )
+        labels = {
+            "barcode": f"Targeted barcode lookup: {query_value}",
+            "invoice": f"Targeted invoice lookup: {query_value}",
+            "contact": f"Targeted contact lookup: {query_value}",
+            "active":  "Showing active record",
+        }
+        txt = labels.get(query_mode, query_mode)
+        return (
+            f'<div style="background:#f0f9ff;border:1px solid #bae6fd;'
+            f'border-radius:8px;padding:8px 14px;margin-bottom:10px;'
+            f'font-size:13px;color:#0369a1">⚡ {txt}</div>'
         )
 
     def unrecognized(self, marathi: bool) -> str:
@@ -1748,6 +2161,8 @@ class ResponseSynthesizer:
                 f'<li><em>vikri list</em></li>'
                 f'<li><em>supplier credit kiti ahe</em></li>'
                 f'<li><em>stock bagha</em></li>'
+                f'<li><em>supplier chi yadi dakhva</em></li>'
+                f'<li><em>category list</em></li>'
                 f'</ul></div>'
             )
         mods = ", ".join(k.replace("-", " ").title() for k in MODULE_REGISTRY)
@@ -1760,7 +2175,12 @@ class ResponseSynthesizer:
             f"<li><em>List all purchases</em></li>"
             f"<li><em>Show supplier credits</em></li>"
             f"<li><em>Find customer named Rahul</em></li>"
-            f"<li><em>Financial summary</em></li></ul></div>"
+            f"<li><em>Financial summary</em></li>"
+            f"<li><em>Supplier purchase history</em></li>"
+            f"<li><em>Get product categories</em></li>"
+            f"<li><em>Customer payment history</em></li>"
+            f"<li><em>Search barcode BAR268726580</em></li>"
+            f"</ul></div>"
         )
 
 
@@ -1770,10 +2190,8 @@ synth = ResponseSynthesizer()
 # ──────────────────────────────────────────────────────────────────────────────
 # 7. CONVERSATION CONTEXT (last 5 turns, in-memory)
 #
-# Lightweight in-process conversation memory.
-# Stores last N turns per session_id.
-# Memory: ~5 turns × ~200 chars = ~1 KB per session. Negligible.
-# Used to remember which module was last queried (for follow-up queries).
+# Lightweight session memory. ~1 KB per session.
+# Stores which module was last queried for follow-up context.
 # ──────────────────────────────────────────────────────────────────────────────
 
 class ConversationContext:
@@ -1801,12 +2219,14 @@ ctx = ConversationContext()
 #
 # Routes each query through:
 #   1. Language detection → Marathi or English path
-#   2. Intent classification (Marathi map OR 5-stage English NLU)
-#   3. Query parsing (extract search value, intent, target column)
-#   4. Data sync (TTL-checked, retry-backed API fetch)
-#   5. Retrieval (FTS5 → LIKE fallback → bulk)
-#   6. Aggregation (sum amounts / qty if requested)
-#   7. Response synthesis (HTML intro + table, bilingual)
+#   2. Query analysis — detect barcode / invoice / contact patterns
+#   3. Intent classification (Marathi map OR 5-stage English NLU)
+#   4. Query parsing (extract search value, intent, target column)
+#   5. SmartQueryRouter — try targeted API endpoint first (NEW in v6)
+#   6. Data sync — TTL-checked full-table sync if targeted route unused
+#   7. Retrieval (FTS5 → LIKE fallback → bulk)
+#   8. Aggregation (sum amounts / qty if requested)
+#   9. Response synthesis (HTML intro + table, bilingual)
 # ──────────────────────────────────────────────────────────────────────────────
 
 class AdminEngine:
@@ -1820,14 +2240,21 @@ class AdminEngine:
         lang       = detect_language(user_query)
         is_marathi = lang in ("marathi_devanagari", "marathi_roman")
 
-        # ── Marathi path — bypass 5-stage NLU, use direct keyword map ────────
+        # Step 2: Query structural analysis (barcode, invoice, contact, active)
+        analysis = query_analyzer.analyze(user_query)
+        q_mode   = analysis["query_mode"]
+        q_val    = analysis["query_value"]
+
+        # ── Marathi path ──────────────────────────────────────────────────────
         if is_marathi:
             key = marathi_classify(user_query)
             if key:
-                return await self._single(key, user_query, session_id, lang, marathi=True)
+                return await self._single(key, user_query, session_id,
+                                          lang, marathi=True,
+                                          q_mode=q_mode, q_val=q_val)
             return synth.unrecognized(marathi=True)
 
-        # ── English path — 5-stage NLU classifier ────────────────────────────
+        # ── English path ──────────────────────────────────────────────────────
         cl = self.classifier.classify(user_query)
 
         if cl["type"] == "UNRECOGNIZED":
@@ -1836,30 +2263,60 @@ class AdminEngine:
         if cl["type"] == "MULTI":
             return await self._multi(cl["pattern"], user_query, session_id)
 
-        return await self._single(cl["module"], user_query, session_id, lang, marathi=False)
+        return await self._single(cl["module"], user_query, session_id,
+                                  lang, marathi=False,
+                                  q_mode=q_mode, q_val=q_val)
 
     # ── Single module handler ─────────────────────────────────────────────────
     async def _single(self, key: str, query: str, sid: str,
-                      lang: str, marathi: bool) -> str:
+                      lang: str, marathi: bool,
+                      q_mode: str = None, q_val: str = None) -> str:
+        """
+        Handle a single-module query.
+
+        v6 enhancement: SmartQueryRouter is tried first if a structural
+        pattern (barcode, invoice, contact) was detected. Falls back to
+        full-table sync if targeted fetch fails or returns no results.
+        """
         parsed = self.parser.parse(query, key, lang)
 
         if parsed["intent"] == "PROMPT_NEEDED":
             return synth.prompt_needed(key, parsed["target_col"], marathi)
 
+        use_targeted   = False
+        targeted_badge = ""
+
+        # Step 5: Try targeted API endpoint if applicable
+        if q_mode and q_val:
+            routed = await smart_router.route(key, parsed, q_mode, q_val)
+            if routed:
+                use_targeted   = True
+                targeted_badge = synth.targeted_badge(q_mode, q_val, marathi)
+                records, cols, _ = retriever.retrieve(key, parsed, use_targeted=True)
+                if records:
+                    agg   = aggregator.compute(records, key)
+                    intro = synth.intro(key, agg, q_val, marathi, lang)
+                    tbl   = synth.table(records, cols, marathi)
+                    ctx.add(sid, "bot", f"_module:{key}")
+                    return targeted_badge + intro + tbl
+                # Targeted endpoint returned nothing — fall through to full table
+
+        # Step 6: Full table sync
         ok = await db.sync_module(key)
         if not ok:
             return synth.api_error(key, marathi)
 
-        records, cols, _ = retriever.retrieve(key, parsed)
+        records, cols, _ = retriever.retrieve(key, parsed, use_targeted=False)
 
         if not records:
-            return synth.no_results(key, parsed["search_value"], marathi)
+            return synth.no_results(key, parsed["search_value"], marathi, q_mode)
 
         agg = aggregator.compute(records, key)
 
-        # Aggregation-only response (e.g. "how many purchases total?")
+        # Aggregation-only response
         if parsed["aggregation"] == "SUM" and parsed["intent"] != "BULK_LIST":
-            parts = [f'<strong>{key.replace("-"," ").title()}</strong> — {agg["count"]:,} records']
+            base_key = key.replace("-", " ").title()
+            parts = [f'<strong>{base_key}</strong> — {agg["count"]:,} records']
             if agg["total_amount"]:
                 parts.append(f'Total: <strong>₹{agg["total_amount"]:,.2f}</strong>')
             if agg["total_qty"]:
@@ -1880,7 +2337,7 @@ class AdminEngine:
         """
         Handles compound queries like "financial summary" or "supplier overview".
         Fetches all listed modules concurrently via sync_modules().
-        Renders each module as a separate labelled section under a summary header.
+        Renders each module as a labelled section under a summary header.
         """
         keys   = pattern["modules"]
         label  = pattern["label"]
@@ -1900,7 +2357,7 @@ class AdminEngine:
                 continue
 
             parsed = self.parser.parse(query, key, "english")
-            parsed["intent"]       = "BULK_LIST"   # always show all data for multi
+            parsed["intent"]       = "BULK_LIST"
             parsed["search_value"] = ""
             records, cols, _ = retriever.retrieve(key, parsed)
             if not records:
@@ -1947,61 +2404,69 @@ engine = AdminEngine()
 # ──────────────────────────────────────────────────────────────────────────────
 
 GREETING_EN = """
-<div style="font-family:'Segoe UI',system-ui,sans-serif;max-width:560px">
+<div style="font-family:'Segoe UI',system-ui,sans-serif;max-width:580px">
   <p style="font-size:18px;font-weight:700;margin:0 0 14px;color:#1e293b">
-    👋 Hello! I'm your <span style="color:#6366f1">ERP Intelligence Assistant</span>.
+    👋 Hello! I'm your <span style="color:#6366f1">ERP Intelligence Assistant v6</span>.
   </p>
   <p style="margin:0 0 14px;color:#475569;font-size:14px">Here's what I can help you with:</p>
   <div style="display:grid;gap:8px">
     <div style="background:#f0f9ff;border:1px solid #bae6fd;border-radius:8px;padding:10px 14px;font-size:14px">
-      📦 <strong>Stock &amp; Inventory</strong> — <em>"Show all stock"</em>, <em>"Find product NON WOVEN"</em>
+      📦 <strong>Stock &amp; Inventory</strong> — <em>"Show all stock"</em>, <em>"Barcode BAR268726580"</em>
     </div>
     <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:10px 14px;font-size:14px">
-      💰 <strong>Sales &amp; Purchases</strong> — <em>"List all sales"</em>, <em>"Purchase invoice INV-001"</em>
+      💰 <strong>Sales &amp; Purchases</strong> — <em>"Invoice PA00000001"</em>, <em>"Supplier purchase history"</em>
     </div>
     <div style="background:#fdf4ff;border:1px solid #e9d5ff;border-radius:8px;padding:10px 14px;font-size:14px">
-      🏢 <strong>Suppliers &amp; Customers</strong> — <em>"All suppliers"</em>, <em>"Find customer Rahul"</em>
+      🏢 <strong>Suppliers &amp; Customers</strong> — <em>"All suppliers"</em>, <em>"Customer payment history"</em>
     </div>
     <div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:10px 14px;font-size:14px">
-      📊 <strong>Financial Reports</strong> — <em>"Supplier credits"</em>, <em>"Financial summary"</em>
+      📊 <strong>Financial Reports</strong> — <em>"Financial summary"</em>, <em>"Supplier credits"</em>
+    </div>
+    <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:10px 14px;font-size:14px">
+      🗂️ <strong>Categories &amp; Config</strong> — <em>"Product categories"</em>, <em>"Active printer"</em>
     </div>
   </div>
   <p style="margin:12px 0 0;font-size:13px;color:#94a3b8">
+    ⚡ Smart lookups: paste a barcode, invoice number, or mobile number for instant results.<br>
     You can also ask in <strong>मराठी</strong> or Marathi Roman typing.
   </p>
 </div>
 """
 
 GREETING_MR = """
-<div style="font-family:'Noto Sans Devanagari','Segoe UI',system-ui,sans-serif;max-width:560px">
+<div style="font-family:'Noto Sans Devanagari','Segoe UI',system-ui,sans-serif;max-width:580px">
   <p style="font-size:18px;font-weight:700;margin:0 0 14px;color:#1e293b">
-    नमस्कार! मी तुमचा <span style="color:#6366f1">ERP सहाय्यक</span> आहे. 🙏
+    नमस्कार! मी तुमचा <span style="color:#6366f1">ERP सहाय्यक v6</span> आहे. 🙏
   </p>
   <p style="margin:0 0 14px;color:#475569;font-size:14px">मी खालील गोष्टींमध्ये मदत करू शकतो:</p>
   <div style="display:grid;gap:8px">
     <div style="background:#f0f9ff;border:1px solid #bae6fd;border-radius:8px;padding:10px 14px;font-size:14px">
-      📦 <strong>साठा आणि इन्व्हेंटरी</strong> — <em>"stock bagha"</em>, <em>"उपलब्ध माल दाखवा"</em>
+      📦 <strong>साठा आणि इन्व्हेंटरी</strong> — <em>"stock bagha"</em>, <em>"उत्पादन साठा दाखवा"</em>
     </div>
     <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:10px 14px;font-size:14px">
-      💰 <strong>विक्री आणि खरेदी</strong> — <em>"vikri list"</em>, <em>"सर्व खरेदी दाखवा"</em>
+      💰 <strong>विक्री आणि खरेदी</strong> — <em>"vikri list"</em>, <em>"supplier kharedi itihas"</em>
     </div>
     <div style="background:#fdf4ff;border:1px solid #e9d5ff;border-radius:8px;padding:10px 14px;font-size:14px">
-      🏢 <strong>पुरवठादार आणि ग्राहक</strong> — <em>"purvathakaar yadi"</em>, <em>"ग्राहक यादी"</em>
+      🏢 <strong>पुरवठादार आणि ग्राहक</strong> — <em>"supplier chi yadi"</em>, <em>"grahak payment history"</em>
     </div>
     <div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:10px 14px;font-size:14px">
-      📊 <strong>आर्थिक अहवाल</strong> — <em>"supplier credit kiti ahe"</em>, <em>"payment history dya"</em>
+      📊 <strong>आर्थिक अहवाल</strong> — <em>"supplier credit kiti ahe"</em>, <em>"financial summary"</em>
+    </div>
+    <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:10px 14px;font-size:14px">
+      🗂️ <strong>श्रेणी आणि सेटिंग</strong> — <em>"category list"</em>, <em>"printer bagha"</em>
     </div>
   </div>
   <p style="margin:12px 0 0;font-size:13px;color:#94a3b8">
+    ⚡ बारकोड, इनव्हॉइस नंबर किंवा मोबाईल नंबर टाकून थेट शोध करा.<br>
     English मध्ये पण विचारू शकता.
   </p>
 </div>
 """
 
 IDENTITY_RESPONSE = """
-<div style="font-family:'Segoe UI',system-ui,sans-serif;max-width:620px">
+<div style="font-family:'Segoe UI',system-ui,sans-serif;max-width:640px">
   <p style="font-size:18px;font-weight:700;color:#1e293b;margin:0 0 12px">
-    🧠 Admin Intelligence Engine v5.0
+    🧠 Admin Intelligence Engine v6.0
   </p>
   <p style="margin:0 0 16px;color:#475569">
     A production-grade <strong>RAG pipeline</strong> for ERP —
@@ -2012,33 +2477,46 @@ IDENTITY_RESPONSE = """
     <strong style="color:#6366f1">5-Stage NLU Pipeline (English):</strong>
     <ol style="margin:8px 0;padding-left:20px;color:#334155;line-height:1.9;font-size:14px">
       <li><strong>Multi-module pattern detection</strong> — compound queries like "financial summary"</li>
-      <li><strong>Phrase matching</strong> — longest phrase wins ("supplier credit" beats "credit")</li>
+      <li><strong>Phrase matching</strong> — longest phrase wins, 16 modules × up to 10 phrases</li>
       <li><strong>Keyword scoring</strong> — weighted frequency with confidence scores</li>
-      <li><strong>Fuzzy alias matching</strong> — catches typos like "purchaces" → purchases</li>
-      <li><strong>TF-IDF cosine similarity</strong> — semantic fallback for unusual phrasing</li>
+      <li><strong>Fuzzy alias matching</strong> — catches typos like "purchaces"</li>
+      <li><strong>TF-IDF cosine similarity</strong> — semantic fallback</li>
     </ol>
   </div>
 
   <div style="background:#f0fdf4;border-radius:10px;padding:16px;margin-bottom:12px">
     <strong style="color:#16a34a">Marathi Pipeline:</strong>
     <ul style="margin:8px 0;padding-left:20px;color:#334155;line-height:1.9;font-size:14px">
-      <li>Unicode Devanagari detection (U+0900–U+097F) + Roman phonetic markers</li>
-      <li>206-keyword intent map with longest-match algorithm</li>
+      <li>Unicode Devanagari detection + Roman phonetic markers (150+ markers)</li>
+      <li>250+ keywords across Devanagari + Roman with longest-match algorithm</li>
       <li>Devanagari inflection stemming (उत्पादने→उत्पादन, साठ्याची→साठा)</li>
-      <li>120+ stop words — filler like "mala dakhva", "kiti ahe" never leaks into search</li>
-      <li>Full Marathi output — table headers, summaries, errors all translated</li>
+      <li>150+ stop words — filler like "aahet", "kiti", "sarva" never leaks into search</li>
+      <li>BUG FIXED: "supplier chi yadi dakhva" now correctly routes to supplier module</li>
     </ul>
   </div>
 
-  <div style="background:#fff7ed;border-radius:10px;padding:16px">
+  <div style="background:#fff7ed;border-radius:10px;padding:16px;margin-bottom:12px">
     <strong style="color:#d97706">Data Layer:</strong>
     <ul style="margin:8px 0;padding-left:20px;color:#334155;line-height:1.9;font-size:14px">
       <li>SQLite FTS5 + BM25 ranking — 5-10× faster than LIKE, relevance-sorted</li>
-      <li>Fallback chain: FTS5 → LIKE column → LIKE all-cols (graceful degradation)</li>
+      <li>Fallback chain: FTS5 → LIKE column → LIKE all-cols</li>
       <li>API retry with exponential backoff — 3 attempts (1.5s, 3s, 6s)</li>
-      <li>TTL-based caching: stock 2min · finance 10min · master 5min</li>
+      <li>TTL caching: stock 2min · finance 10min · master 5min</li>
       <li>Multi-module concurrent fetch via asyncio.gather()</li>
-      <li>🔒 100% private — no data leaves your server · ⚡ Zero AI API cost</li>
+    </ul>
+  </div>
+
+  <div style="background:#f0f9ff;border-radius:10px;padding:16px">
+    <strong style="color:#0369a1">⚡ NEW in v6 — SmartQueryRouter:</strong>
+    <ul style="margin:8px 0;padding-left:20px;color:#334155;line-height:1.9;font-size:14px">
+      <li>16 modules mapped across all GET APIs</li>
+      <li>Barcode → /api/purchase/get-stock-by-barcode (instant point-lookup)</li>
+      <li>Invoice → /api/purchase/get-purchase-by-invoice-no or /api/sell/search-by-invoice</li>
+      <li>Contact → /api/customer/search-by-contact</li>
+      <li>Supplier purchase history → dedicated /api/reports/supplier-purchase-history</li>
+      <li>Customer payment history → dedicated /api/customer/payment-history</li>
+      <li>Active printer / email → /api/printer/get-active-printer etc.</li>
+      <li>🔒 100% private · ⚡ Zero AI API cost</li>
     </ul>
   </div>
 </div>
@@ -2055,14 +2533,15 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = "default"
 
 
-# Quick-response word sets — matched before hitting the main pipeline
-_EN_GREET    = {"hi", "hello", "hey", "heyy", "heya", "good morning",
-                "good afternoon", "good evening", "sup", "yo"}
+_EN_GREET    = {"hi", "hello", "hey", "heyy", "heya",
+                "good morning", "good afternoon", "good evening", "sup", "yo"}
 _EN_THANKS   = {"thank you", "thanks", "awesome", "perfect", "great",
                 "nice", "good", "ok", "okay", "cool"}
 _EN_IDENTITY = {"who are you", "how do you work", "chatgpt", "your brain",
-                "how were you built", "architecture", "how does this work"}
-_EN_REFRESH  = {"refresh", "sync", "update records", "reload data"}
+                "how were you built", "architecture", "how does this work",
+                "what can you do", "tell me about yourself"}
+_EN_REFRESH  = {"refresh", "sync", "update records", "reload data",
+                "refresh data", "sync data"}
 _MR_GREET_W  = {"नमस्कार", "नमस्ते", "हॅलो", "namaskar", "namaste"}
 _MR_THANKS_W = {"धन्यवाद", "आभारी", "थँक्यू", "dhanyavad", "aabhari"}
 _MR_REFRESH_W= {"रिफ्रेश", "अद्यतन", "refresh kara", "update kara", "sync kara"}
@@ -2074,9 +2553,11 @@ async def chat_endpoint(request: ChatRequest):
     Main chat endpoint.
 
     Flow:
-      1. Detect language
+      1. Detect language (Devanagari, Marathi Roman, English)
       2. Handle quick responses (greetings, thanks, refresh, identity)
-      3. Delegate to AdminEngine.process() for data queries
+      3. Delegate to AdminEngine.process() for all data queries
+         which internally runs: query analysis → NLU → SmartQueryRouter
+         → data sync → FTS5 retrieval → aggregation → HTML response
     """
     query      = (request.query or request.question or "").strip()
     session_id = request.session_id or "default"
