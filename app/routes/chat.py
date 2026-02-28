@@ -2426,7 +2426,7 @@ if _FASTAPI_AVAILABLE:
     from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.requests import Request as StarletteRequest
     from starlette.responses import Response as StarletteResponse
-
+     
     # ── FIX-1: Startup readiness — blocks requests until warmup done ──────────
     async def _warmup():
         """Pre-fetch the 4 most common modules, then signal ready."""
@@ -2444,7 +2444,7 @@ if _FASTAPI_AVAILABLE:
         yield
         await db.close()
         log.info("HTTP client closed")
-
+    router = APIRouter()
     app = FastAPI(
         title="ERP Intelligence Engine v6.3",
         lifespan=lifespan,
