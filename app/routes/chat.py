@@ -1,37 +1,44 @@
 """
 ==============================================================================
-  ADMIN INTELLIGENCE ENGINE  v3.0
+  ADMIN INTELLIGENCE ENGINE  v4.0
   Production-grade RAG pipeline for ERP chatbot
   Zero external AI APIs · Pure stdlib + SQLite FTS5 · <120 MB RAM
+  Full Marathi language support (Devanagari + Roman transliteration)
 ==============================================================================
 
 ARCHITECTURE
-┌─────────────────────────────────────────────────────────────┐
-│  User Query                                                  │
-│      │                                                       │
-│      ▼                                                       │
-│  QueryParser  ──►  Intent Classifier  ──►  Multi-API Planner│
-│                         │                        │          │
-│                         ▼                        ▼          │
-│                   SQLite Mirror         Async Fetch Pool    │
-│                   (FTS5 search)              │              │
-│                         │                    │              │
-│                         ▼                    ▼              │
-│                   RAG Retriever  ──►  Response Synthesizer  │
-│                                            │                │
-│                                            ▼                │
-│                                    HTML/JSON Response        │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  User Query (English / मराठी / Marathi Roman typing)             │
+│      │                                                           │
+│      ▼                                                           │
+│  LanguageDetector ──► MarathiClassifier (if Marathi detected)   │
+│      │                        │                                  │
+│      │ (English)              │ (Marathi)                        │
+│      ▼                        ▼                                  │
+│  IntentClassifier      MarathiIntentMap                          │
+│  (5-stage NLU)               │                                  │
+│      │                        │                                  │
+│      └──────────┬─────────────┘                                  │
+│                 ▼                                                 │
+│          Multi-API Planner ──► Async Fetch Pool                  │
+│                 │                      │                          │
+│                 ▼                      ▼                          │
+│           SQLite FTS5 Mirror    DataMirror Cache                  │
+│                 │                                                 │
+│                 ▼                                                 │
+│          RAG Retriever ──► ResponseSynthesizer                   │
+│                                    │                             │
+│                                    ▼                             │
+│          HTML Response (English or मराठी based on input)         │
+└──────────────────────────────────────────────────────────────────┘
 
-KEY INNOVATIONS vs v2:
-  1. SQLite FTS5  — full-text search index, 10x faster than LIKE scans
-  2. Multi-API planner — single query can fetch from multiple endpoints
-  3. BM25 ranking  — built into FTS5, better than TF-IDF cosine
-  4. 5-stage NLU pipeline with confidence scoring
-  5. Response synthesizer — natural language summaries + structured tables
-  6. Smart caching with per-module TTL and memory pressure eviction
-  7. Async connection pooling for ERP API calls
-  8. Conversation context window (last 5 turns in RAM)
+KEY INNOVATIONS vs v3:
+  1. Language detection — Devanagari Unicode + Roman phonetic markers
+  2. Marathi intent map — 206 keywords across Devanagari + Roman
+  3. Marathi response synthesizer — headers, summaries, UI in Marathi
+  4. Marathi column translations — all 40+ ERP column headers translated
+  5. Longest-match algorithm — most specific Marathi phrase wins
+  6. Mixed-language queries — "supplier credit kiti ahe" works perfectly
 ==============================================================================
 """
 
@@ -71,6 +78,458 @@ FINANCE_TTL = 600          # 10 min for ledgers
 
 # Hard limit on rows kept in SQLite per module (prevents RAM explosion)
 MAX_ROWS_PER_MODULE = 50_000
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MARATHI LANGUAGE LAYER
+# Covers three input modes:
+#   1. Devanagari script  — e.g. "सर्व खरेदी दाखवा"
+#   2. Roman transliteration (Marathi typing) — e.g. "kharedi list dya"
+#   3. Mixed — e.g. "supplier credit kiti ahe"
+#
+# Design principles:
+#   - Longest-match wins (more specific phrase beats shorter keyword)
+#   - Devanagari detection via Unicode range U+0900–U+097F
+#   - Roman detection via a curated list of Marathi phonetic markers
+#   - All detection is O(n*m) with n=query_tokens, m=keyword_count — fast
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── Column header translations ────────────────────────────────────────────────
+MARATHI_COLUMNS: dict = {
+    "Invoice No":      "इनव्हॉइस क्र.",
+    "Name":            "नाव",
+    "Email":           "ईमेल",
+    "Contact":         "संपर्क",
+    "Address":         "पत्ता",
+    "Supplier Name":   "पुरवठादाराचे नाव",
+    "Customer Name":   "ग्राहकाचे नाव",
+    "Product Name":    "उत्पादनाचे नाव",
+    "Material Name":   "साहित्याचे नाव",
+    "Total Amount":    "एकूण रक्कम",
+    "Sell Price":      "विक्री किंमत",
+    "Stock Quantity":  "साठ्याची संख्या",
+    "Quantity":        "संख्या",
+    "Qty":             "संख्या",
+    "Paid":            "दिलेले",
+    "Credit Amount":   "क्रेडिट रक्कम",
+    "Balance":         "शिल्लक",
+    "Debit":           "नावे",
+    "Credit":          "जमा",
+    "Date":            "तारीख",
+    "Created At":      "तयार तारीख",
+    "Updated At":      "अद्यतन तारीख",
+    "Created By":      "तयार केले",
+    "Updated By":      "अद्यतन केले",
+    "Barcode":         "बारकोड",
+    "Gst No":          "जीएसटी क्र.",
+    "Supply Type":     "पुरवठा प्रकार",
+    "Status":          "स्थिती",
+    "Price Per Unit":  "प्रति युनिट किंमत",
+    "Purchase Date":   "खरेदी तारीख",
+    "Sell Date":       "विक्री तारीख",
+    "Unit":            "युनिट",
+    "Size":            "आकार",
+    "Color":           "रंग",
+    "Category":        "श्रेणी",
+    "Description":     "वर्णन",
+    "Supplier Credit": "पुरवठादार क्रेडिट",
+    "First Name":      "पहिले नाव",
+    "Last Name":       "आडनाव",
+    "Phone":           "फोन",
+    "City":            "शहर",
+    "Type":            "प्रकार",
+    "Mode":            "पद्धत",
+    "Hsn No":          "एचएसएन क्र.",
+    "Price Code":      "किंमत कोड",
+    "Image Url":       "प्रतिमा",
+    "Product Code":    "उत्पादन कोड",
+    "Host":            "होस्ट",
+    "Port":            "पोर्ट",
+    "Gst No":          "जीएसटी क्र.",
+    "Bill No":         "बिल क्र.",
+    "Mobile":          "मोबाईल",
+}
+
+# ── Module name translations ──────────────────────────────────────────────────
+MARATHI_MODULES: dict = {
+    "purchase":        "खरेदी",
+    "sell":            "विक्री",
+    "supplier-credit": "पुरवठादार क्रेडिट",
+    "supplier-ledger": "पुरवठादार खातेवही",
+    "customer-ledger": "ग्राहक खातेवही",
+    "customer":        "ग्राहक",
+    "supplier":        "पुरवठादार",
+    "product-stock":   "उत्पादन साठा",
+    "payment":         "देयक",
+    "material":        "साहित्य",
+    "category":        "श्रेणी",
+    "printer":         "प्रिंटर",
+    "email-config":    "ईमेल सेटिंग",
+}
+
+# ── Intent keyword map — Devanagari + Roman per module ────────────────────────
+# Sorted by length descending at runtime so longest match wins
+MARATHI_INTENT_MAP: dict = {
+    "purchase": {
+        "deva": [
+            "खरेदी यादी", "खरेदी ऑर्डर", "खरेदी इनव्हॉइस",
+            "खरेदी इतिहास", "माल खरेदी", "खरेदी नोंदी",
+            "काय खरेदी केले", "सर्व खरेदी", "खरेदी",
+        ],
+        "roman": [
+            "kharedi yadi", "kharedi order", "kharedi invoice",
+            "kharedi itihas", "mal kharedi", "kharedi nondi",
+            "kay kharedi kele", "sarv kharedi", "kharedi list",
+            "kharedee list", "kharidi list", "kharedee itihas",
+            "purchase kele", "purchase list", "kharidi yadi",
+            "kharedi", "kharedee", "kharidi",
+        ],
+    },
+    "sell": {
+        "deva": [
+            "विक्री यादी", "विक्री इनव्हॉइस", "विक्री इतिहास",
+            "विक्री नोंदी", "माल विकला", "काय विकले",
+            "सर्व विक्री", "विक्री तपशील", "विक्री",
+            "बिल", "पावती",
+        ],
+        "roman": [
+            "vikri yadi", "vikri invoice", "vikri itihas",
+            "vikri nondi", "mal vikla", "kay vikle",
+            "sarv vikri", "vikri tapshil", "vikri list",
+            "vikree list", "vikri history", "sales list",
+            "vikri", "vikree", "pavti",
+        ],
+    },
+    "supplier-credit": {
+        "deva": [
+            "पुरवठादार क्रेडिट", "क्रेडिट शिल्लक",
+            "किती देणे आहे", "पुरवठादाराचे देणे",
+            "बाकी रक्कम", "पुरवठादार बाकी",
+            "थकबाकी", "देणे", "उधार", "क्रेडिट",
+        ],
+        "roman": [
+            "purvathakaar credit", "puravathakaar credit",
+            "credit shillak", "kiti dene ahe",
+            "purvathakaarache dene", "baki rakkam",
+            "purvathakaar baki", "supplier credit",
+            "vendor credit", "credit balance",
+            "thakbaki", "udhar", "dene", "credit",
+        ],
+    },
+    "supplier-ledger": {
+        "deva": [
+            "पुरवठादार खातेवही", "पुरवठादार हिशेब",
+            "पुरवठादार विवरण", "पुरवठादार खाते",
+        ],
+        "roman": [
+            "purvathakaar khatevahi", "purvathakaar hisab",
+            "purvathakaar vivaran", "purvathakaar khate",
+            "puravathakaar khatevahi", "supplier ledger",
+            "vendor ledger", "supplier hisab",
+        ],
+    },
+    "customer-ledger": {
+        "deva": [
+            "ग्राहक खातेवही", "ग्राहक हिशेब",
+            "ग्राहक विवरण", "ग्राहक खाते",
+        ],
+        "roman": [
+            "grahak khatevahi", "grahak hisab",
+            "grahak vivaran", "grahak khate",
+            "graahak khatevahi", "customer ledger",
+            "customer hisab",
+        ],
+    },
+    "customer": {
+        "deva": [
+            "ग्राहक यादी", "सर्व ग्राहक", "ग्राहक माहिती",
+            "खरेदीदार", "ग्राहक",
+        ],
+        "roman": [
+            "grahak yadi", "sarv grahak", "grahak mahiti",
+            "kharedidar", "grahak list", "graahak list",
+            "customer list", "grahak", "graahak",
+        ],
+    },
+    "supplier": {
+        "deva": [
+            "पुरवठादार यादी", "सर्व पुरवठादार",
+            "विक्रेता", "माल पुरवठादार", "पुरवठादार",
+        ],
+        "roman": [
+            "purvathakaar yadi", "sarv purvathakaar",
+            "vikreta", "mal purvathakaar",
+            "supplier list", "vendor list",
+            "purvathakaar", "puravathakaar",
+        ],
+    },
+    "product-stock": {
+        "deva": [
+            "माल साठा", "उपलब्ध माल", "किती साठा आहे",
+            "स्टॉक यादी", "उपलब्ध स्टॉक",
+            "गोदाम", "इन्व्हेंटरी", "साठा", "स्टॉक",
+        ],
+        "roman": [
+            "mal satha", "uplabdh mal", "kiti satha ahe",
+            "stock yadi", "uplabdh stock",
+            "stock kiti ahe", "stock bagha", "stock list",
+            "inventory list", "godam", "saatha",
+            "satha", "stock",
+        ],
+    },
+    "payment": {
+        "deva": [
+            "पेमेंट इतिहास", "दिलेले पैसे",
+            "पुरवठादार देयक", "व्यवहार नोंदी",
+            "पैसे दिले", "व्यवहार", "देयक", "पेमेंट",
+        ],
+        "roman": [
+            "payment itihas", "dilele paise",
+            "purvathakaar dayak", "vyavahar nondi",
+            "paise dile", "payment history",
+            "payment list", "vyavahar", "dayak", "payment",
+        ],
+    },
+    "material": {
+        "deva": [
+            "कच्चा माल", "माल यादी", "साहित्य यादी",
+            "कापड यादी", "साहित्य", "कापड", "घटक", "सामग्री",
+        ],
+        "roman": [
+            "kachha mal", "mal yadi", "sahitya yadi",
+            "kapad yadi", "material list", "raw material",
+            "sahitya", "kapad", "ghatak", "samagri",
+        ],
+    },
+    "category": {
+        "deva": [
+            "श्रेणी यादी", "वर्गीकरण", "उत्पादन प्रकार", "श्रेणी", "प्रकार",
+        ],
+        "roman": [
+            "shreni yadi", "vargikaran", "utpadan prakar",
+            "category list", "shreni", "prakar",
+        ],
+    },
+    "printer": {
+        "deva": ["प्रिंटर यादी", "मुद्रण यंत्र", "प्रिंटर"],
+        "roman": ["printer yadi", "mudran yantra", "printer list", "printer"],
+    },
+    "email-config": {
+        "deva": ["ईमेल सेटिंग", "ईमेल", "मेल"],
+        "roman": ["email settings", "email config", "mail config", "email"],
+    },
+}
+
+# ── Marathi Roman phonetic markers (used for language detection) ──────────────
+_MARATHI_ROMAN_MARKERS: frozenset = frozenset([
+    "kharedi", "kharedee", "kharidi", "vikri", "vikree",
+    "grahak", "graahak", "purvathakaar", "puravathakaar",
+    "satha", "saatha", "thakbaki", "udhar", "dene",
+    "yadi", "bagha", "dakha", "ahe", "aahe", "sarv",
+    "saglya", "hisab", "hisaab", "khatevahi", "vivaran",
+    "dayak", "paise", "paisa", "kachha", "sahitya",
+    "kapad", "shreni", "uplabdh", "godam", "vyavahar",
+    "pavti", "baki", "shillak", "rakkam", "vikreta",
+    "kiti", "mal", "nondi", "tapshil", "itihas",
+    "mahiti", "dilele", "dile", "kele", "vikle",
+])
+
+# Pre-sort all keyword lists by length descending (longest match wins)
+_MARATHI_SORTED: dict = {}
+for _mod, _kws in MARATHI_INTENT_MAP.items():
+    all_kws = [(k.lower(), _mod) for k in _kws["deva"] + _kws["roman"]]
+    all_kws.sort(key=lambda x: len(x[0]), reverse=True)
+    _MARATHI_SORTED[_mod] = all_kws
+# Flat sorted list for classification
+_MARATHI_FLAT: list = []
+for _mod, _kws in MARATHI_INTENT_MAP.items():
+    for k in _kws["deva"] + _kws["roman"]:
+        _MARATHI_FLAT.append((k.lower(), _mod))
+_MARATHI_FLAT.sort(key=lambda x: len(x[0]), reverse=True)
+
+
+def detect_language(text: str) -> str:
+    """
+    Returns: 'marathi_devanagari' | 'marathi_roman' | 'english'
+    Fast: O(len(text)) for Devanagari check, O(markers) for Roman check.
+    """
+    deva_count  = sum(1 for c in text if 0x0900 <= ord(c) <= 0x097F)
+    alpha_count = sum(1 for c in text if c.isalpha())
+    if alpha_count == 0:
+        return "english"
+    if deva_count / alpha_count > 0.25:
+        return "marathi_devanagari"
+    t = text.lower()
+    if any(marker in t for marker in _MARATHI_ROMAN_MARKERS):
+        return "marathi_roman"
+    return "english"
+
+
+def marathi_classify(text: str) -> Optional[str]:
+    """
+    Classify a Marathi query (Devanagari or Roman) to a module key.
+    Uses longest-match: 'purvathakaar credit' beats 'credit'.
+    Returns module key string or None.
+    """
+    t = text.lower().strip()
+    for keyword, module in _MARATHI_FLAT:
+        if keyword in t:
+            return module
+    return None
+
+
+def translate_column(col_label: str) -> str:
+    """Translate an English column header to Marathi. Falls back to original."""
+    return MARATHI_COLUMNS.get(col_label, col_label)
+
+
+def translate_module(module_key: str) -> str:
+    """Translate a module key to Marathi display name."""
+    return MARATHI_MODULES.get(module_key, module_key.replace("-", " ").title())
+
+
+# ── Marathi response strings ──────────────────────────────────────────────────
+def mr_intro(module_key: str, count: int, search_val: str,
+             amount: Optional[float], qty: Optional[int]) -> str:
+    """Generate a Marathi intro paragraph for the response."""
+    mod_label = translate_module(module_key)
+    if search_val:
+        text = (
+            f'<strong>{mod_label}</strong> मध्ये '
+            f'<strong>"{search_val}"</strong> साठी शोधले — '
+            f'<strong>{count:,} नोंदी</strong> सापडल्या.'
+        )
+    else:
+        text = (
+            f'<strong>{mod_label}</strong> ची संपूर्ण यादी — '
+            f'<strong>{count:,} नोंदी</strong>.'
+        )
+    insights = []
+    if amount:
+        insights.append(f'एकूण रक्कम: <strong>₹{amount:,.2f}</strong>')
+    if qty:
+        insights.append(f'एकूण युनिट: <strong>{qty:,}</strong>')
+    if insights:
+        text += " &nbsp;·&nbsp; " + " &nbsp;·&nbsp; ".join(insights)
+    return f'<p style="margin:0 0 16px;font-size:15px;">{text}</p>'
+
+
+def mr_no_results(module_key: str, search_val: str) -> str:
+    mod_label = translate_module(module_key)
+    return (
+        f'<div style="background:#fef2f2;border:1px solid #fecaca;'
+        f'border-radius:10px;padding:16px 20px;color:#991b1b;">'
+        f'<strong>{mod_label}</strong> मध्ये '
+        f'<strong>"{search_val}"</strong> साठी काहीही सापडले नाही.<br>'
+        f'<small style="color:#b91c1c">टीप: शब्दलेखन तपासा किंवा लहान शब्द वापरा.</small>'
+        f'</div>'
+    )
+
+
+def mr_api_error(module_key: str) -> str:
+    mod_label = translate_module(module_key)
+    return (
+        f'<div style="background:#fff7ed;border:1px solid #fed7aa;'
+        f'border-radius:10px;padding:16px 20px;color:#9a3412;">'
+        f'⚠️ <strong>{mod_label}</strong> चा डेटा मिळवता आला नाही. '
+        f'ERP कनेक्शन तपासा आणि पुन्हा प्रयत्न करा.'
+        f'</div>'
+    )
+
+
+def mr_prompt_needed(module_key: str, col_label: str) -> str:
+    mod_label = translate_module(module_key)
+    col_mr    = MARATHI_COLUMNS.get(col_label, col_label)
+    return (
+        f'तुम्ही <strong>{mod_label}</strong> विभागात शोधत आहात. '
+        f'कृपया <strong>{col_mr}</strong> सांगा.<br>'
+        f'<em>उदाहरण: "invoice INV-1042" किंवा "name Rahul"</em>'
+    )
+
+
+def mr_unrecognized() -> str:
+    modules_list = " · ".join(translate_module(m) for m in MARATHI_MODULES.keys())
+    return (
+        f'<div style="background:#f8fafc;border:1px solid #e2e8f0;'
+        f'border-radius:10px;padding:16px 20px;">'
+        f'<strong>मला समजले नाही.</strong> मी खालील गोष्टींमध्ये मदत करू शकतो:<br>'
+        f'<em>{modules_list}</em><br><br>'
+        f'उदाहरणे:<ul style="margin:8px 0;padding-left:20px">'
+        f'<li><em>सर्व खरेदी दाखवा</em></li>'
+        f'<li><em>vikri list</em></li>'
+        f'<li><em>supplier credit kiti ahe</em></li>'
+        f'<li><em>grahak list dya</em></li>'
+        f'</ul></div>'
+    )
+
+
+MARATHI_GREETING = """
+<div style="font-family:'Noto Sans Devanagari','Segoe UI',system-ui,sans-serif;max-width:560px">
+  <p style="font-size:17px;font-weight:600;margin:0 0 12px">
+    नमस्कार! मी तुमचा <span style="color:#6366f1">ERP सहाय्यक</span> आहे. 🙏
+  </p>
+  <p style="margin:0 0 14px;color:#475569">मी खालील गोष्टींमध्ये मदत करू शकतो:</p>
+  <div style="display:grid;gap:8px">
+    <div style="background:#f0f9ff;border:1px solid #bae6fd;border-radius:8px;padding:10px 14px">
+      📦 <strong>साठा आणि इन्व्हेंटरी</strong> — <em>"stock bagha"</em>, <em>"उपलब्ध माल दाखवा"</em>
+    </div>
+    <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:10px 14px">
+      💰 <strong>विक्री आणि खरेदी</strong> — <em>"vikri list"</em>, <em>"सर्व खरेदी दाखवा"</em>
+    </div>
+    <div style="background:#fdf4ff;border:1px solid #e9d5ff;border-radius:8px;padding:10px 14px">
+      🏢 <strong>पुरवठादार आणि ग्राहक</strong> — <em>"purvathakaar yadi"</em>, <em>"ग्राहक यादी"</em>
+    </div>
+    <div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:10px 14px">
+      📊 <strong>आर्थिक अहवाल</strong> — <em>"supplier credit kiti ahe"</em>, <em>"payment history"</em>
+    </div>
+  </div>
+  <p style="margin:12px 0 0;font-size:13px;color:#94a3b8">
+    तुम्ही मराठी, English किंवा मराठी टायपिंग (Roman) मध्ये विचारू शकता.
+  </p>
+</div>
+"""
+
+MARATHI_THANKS = [
+    "आपले स्वागत आहे! आणखी काही हवे असल्यास सांगा.",
+    "माझ्यासाठी हे काम करणे आनंददायक आहे! आणखी काही?",
+    "नक्कीच! आणखी कोणता डेटा पाहायचा आहे?",
+]
+
+MARATHI_REFRESH = (
+    '<div style="background:#f0fdf4;border:1px solid #bbf7d0;'
+    'border-radius:10px;padding:14px 18px;color:#166534">'
+    '🔄 <strong>सर्व माहिती अद्यतनित झाली.</strong> ERP डेटा ताजा आहे. आता काय पाहायचे आहे?'
+    '</div>'
+)
+
+# ── Marathi greeting / thanks detection ──────────────────────────────────────
+_MARATHI_GREET_WORDS: frozenset = frozenset([
+    "नमस्कार", "नमस्ते", "हॅलो", "हॅलो", "सुप्रभात",
+    "namaskar", "namaste", "hello", "namaskar",
+])
+_MARATHI_THANKS_WORDS: frozenset = frozenset([
+    "धन्यवाद", "आभारी", "थँक्यू",
+    "dhanyavad", "aabhari", "thankyou", "shukriya",
+])
+_MARATHI_REFRESH_WORDS: frozenset = frozenset([
+    "रिफ्रेश", "अद्यतन करा", "माहिती ताजी करा",
+    "refresh kara", "update kara", "sync kara",
+])
+
+
+def is_marathi_greeting(text: str) -> bool:
+    t = text.lower().strip()
+    return any(w in t for w in _MARATHI_GREET_WORDS) and len(t.split()) <= 4
+
+
+def is_marathi_thanks(text: str) -> bool:
+    t = text.lower().strip()
+    return any(w in t for w in _MARATHI_THANKS_WORDS)
+
+
+def is_marathi_refresh(text: str) -> bool:
+    t = text.lower().strip()
+    return any(w in t for w in _MARATHI_REFRESH_WORDS)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1139,7 +1598,13 @@ class ResponseSynthesizer:
         agg: dict,
         search_val: str,
         module_label: str,
+        marathi: bool = False,
     ) -> str:
+        # Delegate to Marathi string builder
+        if marathi:
+            return mr_intro(module_key, agg["count"], search_val,
+                            agg["total_amount"], agg["total_qty"])
+
         count = agg["count"]
         amt   = agg["total_amount"]
         qty   = agg["total_qty"]
@@ -1244,17 +1709,19 @@ class ResponseSynthesizer:
         return val
 
     # ── Build HTML table ─────────────────────────────────────────────────────
-    def build_table(self, records: list, columns: list) -> str:
+    def build_table(self, records: list, columns: list, marathi: bool = False) -> str:
         headers = self._visible_headers(columns)
         if not headers:
             return "<p>No displayable columns.</p>"
 
+        font = "'Noto Sans Devanagari','Segoe UI',system-ui,sans-serif" if marathi else "'Segoe UI',system-ui,sans-serif"
+
         # ── Table wrapper ────────────────────────────────────────────────────
-        html = """
+        html = f"""
 <div style="overflow-x:auto;margin-top:4px;border-radius:12px;
      box-shadow:0 4px 24px rgba(0,0,0,.08);border:1px solid #e2e8f0;">
 <table style="border-collapse:collapse;width:100%;text-align:left;
-     background:#fff;font-family:'Segoe UI',system-ui,sans-serif;min-width:520px;">
+     background:#fff;font-family:{font};min-width:520px;">
 """
 
         # ── Header row ───────────────────────────────────────────────────────
@@ -1263,11 +1730,12 @@ class ResponseSynthesizer:
             'color:#f8fafc;">'
         )
         for h in headers:
-            label = re.sub(r"([a-z])([A-Z])", r"\1 \2", h).title()
+            eng_label = re.sub(r"([a-z])([A-Z])", r"\1 \2", h).title()
+            label = translate_column(eng_label) if marathi else eng_label
             html += (
                 f'<th style="padding:13px 16px;border-right:1px solid #475569;'
-                f'font-size:12px;font-weight:600;text-transform:uppercase;'
-                f'letter-spacing:.05em;white-space:nowrap">{label}</th>'
+                f'font-size:12px;font-weight:600;'
+                f'letter-spacing:.03em;white-space:nowrap">{label}</th>'
             )
         html += "</tr></thead><tbody>"
 
@@ -1384,28 +1852,43 @@ class AdminIntelligenceEngine:
         # ── Context: track conversation ──────────────────────────────────────
         context_store.add(session_id, "user", user_query)
 
-        # ── Classify intent ──────────────────────────────────────────────────
+        # ── Language detection ───────────────────────────────────────────────
+        lang = detect_language(user_query)
+        is_marathi = lang in ("marathi_devanagari", "marathi_roman")
+
+        # ── If Marathi: use Marathi intent map directly ──────────────────────
+        if is_marathi:
+            module_key = marathi_classify(user_query)
+            if module_key:
+                return await self._handle_single(
+                    module_key, user_query, session_id, marathi=True
+                )
+            # Marathi query but no module found
+            return mr_unrecognized()
+
+        # ── English: use 5-stage NLU classifier ─────────────────────────────
         classification = self.classifier.classify(user_query)
 
         if classification["type"] == "UNRECOGNIZED":
             return self._unrecognized_response()
 
-        # ── Multi-module query ───────────────────────────────────────────────
         if classification["type"] == "MULTI":
             return await self._handle_multi(
                 classification["pattern"], user_query, session_id
             )
 
-        # ── Single module query ──────────────────────────────────────────────
         module_key = classification["module"]
-        return await self._handle_single(module_key, user_query, session_id)
+        return await self._handle_single(module_key, user_query, session_id, marathi=False)
 
     # ── Single module ────────────────────────────────────────────────────────
-    async def _handle_single(self, module_key: str, user_query: str, session_id: str) -> str:
+    async def _handle_single(self, module_key: str, user_query: str,
+                              session_id: str, marathi: bool = False) -> str:
         parsed = self.parser.parse(user_query, module_key)
 
         if parsed["intent"] == "PROMPT_NEEDED":
             col_label = re.sub(r"([a-z])([A-Z])", r"\1 \2", parsed["target_col"]).title()
+            if marathi:
+                return mr_prompt_needed(module_key, col_label)
             return (
                 f'You\'re querying the <strong>{module_key.replace("-", " ").title()}</strong> module. '
                 f'Could you please specify the <strong>{col_label}</strong>?<br>'
@@ -1415,13 +1898,15 @@ class AdminIntelligenceEngine:
         # Sync data
         ok = await db.sync_module(module_key)
         if not ok:
-            return synthesizer.api_error(module_key)
+            return mr_api_error(module_key) if marathi else synthesizer.api_error(module_key)
 
         # Retrieve
         records, columns, method = retriever.retrieve(module_key, parsed)
         label = module_key.replace("-", " ").title()
 
         if not records:
+            if marathi:
+                return mr_no_results(module_key, parsed["search_value"])
             return synthesizer.no_results(module_key, parsed["search_value"])
 
         # Aggregate
@@ -1433,13 +1918,13 @@ class AdminIntelligenceEngine:
 
         # Full response
         intro = synthesizer.build_intro(
-            module_key, parsed, agg, parsed["search_value"], label
+            module_key, parsed, agg, parsed["search_value"], label, marathi=marathi
         )
-        table = synthesizer.build_table(records, columns)
+        table = synthesizer.build_table(records, columns, marathi=marathi)
         response = intro + table
 
-        # Store context
-        context_store.add(session_id, "bot", f"_module:{module_key} {label} ({agg['count']} records)")
+        context_store.add(session_id, "bot",
+                          f"_module:{module_key} {label} ({agg['count']} records)")
         return response
 
     # ── Multi module ─────────────────────────────────────────────────────────
@@ -1645,38 +2130,46 @@ async def chat_endpoint(request: ChatRequest):
     session_id = request.session_id or "default"
 
     if not user_query:
-        return {"response": "Please type a question to get started."}
+        return {"response": "Please type a question to get started. / कृपया प्रश्न टाइप करा."}
 
-    # ── Greeting ─────────────────────────────────────────────────────────────
-    if _is_greeting(user_query):
-        return {"response": GREETING_RESPONSE}
+    lang = detect_language(user_query)
+    is_marathi = lang in ("marathi_devanagari", "marathi_roman")
 
-    # ── Thanks ───────────────────────────────────────────────────────────────
-    if _is_thanks(user_query):
-        return {
-            "response": random.choice([
-                "You're welcome! Let me know if you need more data.",
-                "Happy to help! Anything else?",
-                "My pleasure! Type another query anytime.",
-            ])
-        }
+    # ── Marathi-specific quick responses ─────────────────────────────────────
+    if is_marathi:
+        if is_marathi_greeting(user_query):
+            return {"response": MARATHI_GREETING}
+        if is_marathi_thanks(user_query):
+            return {"response": random.choice(MARATHI_THANKS)}
+        if is_marathi_refresh(user_query):
+            await db.sync_all(force=True)
+            return {"response": MARATHI_REFRESH}
 
-    # ── Identity ─────────────────────────────────────────────────────────────
-    if _is_identity(user_query):
-        return {"response": IDENTITY_RESPONSE}
+    # ── English quick responses ───────────────────────────────────────────────
+    if not is_marathi:
+        if _is_greeting(user_query):
+            return {"response": GREETING_RESPONSE}
+        if _is_thanks(user_query):
+            return {
+                "response": random.choice([
+                    "You're welcome! Let me know if you need more data.",
+                    "Happy to help! Anything else?",
+                    "My pleasure! Type another query anytime.",
+                ])
+            }
+        if _is_identity(user_query):
+            return {"response": IDENTITY_RESPONSE}
+        if _is_refresh(user_query):
+            await db.sync_all(force=True)
+            return {
+                "response": (
+                    '<div style="background:#f0fdf4;border:1px solid #bbf7d0;'
+                    'border-radius:10px;padding:14px 18px;color:#166534">'
+                    '🔄 <strong>All modules synced.</strong> ERP data is up to date. What would you like to see?'
+                    '</div>'
+                )
+            }
 
-    # ── Force sync ───────────────────────────────────────────────────────────
-    if _is_refresh(user_query):
-        await db.sync_all(force=True)
-        return {
-            "response": (
-                '<div style="background:#f0fdf4;border:1px solid #bbf7d0;'
-                'border-radius:10px;padding:14px 18px;color:#166534">'
-                '🔄 <strong>All modules synced.</strong> ERP data is up to date. What would you like to see?'
-                '</div>'
-            )
-        }
-
-    # ── Main intelligence pipeline ───────────────────────────────────────────
+    # ── Main intelligence pipeline ────────────────────────────────────────────
     response = await engine.process(user_query, session_id)
     return {"response": response}
