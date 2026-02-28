@@ -1,7 +1,3 @@
-import logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 import asyncio, re, time, random, os, math, sqlite3
 from collections import Counter
 from fastapi import APIRouter, Request
@@ -16,10 +12,9 @@ router = APIRouter()
 BASE_URL = "https://umbrellasales.xyz/umbrella-inventory-server"
 LOGIN_URL = f"{BASE_URL}/api/service/login"
 LOGIN_PAYLOAD = {
-    "username": os.environ["ERP_USERNAME"], # Will securely crash if env var is missing
-    "password": os.environ["ERP_PASSWORD"]
+    "username": os.getenv("ERP_USERNAME", "superadmin.com"),
+    "password": os.getenv("ERP_PASSWORD", "superadmin@123")
 }
-BASE_URL = os.getenv("ERP_BASE_URL", "https://umbrellasales.xyz/umbrella-inventory-server")
 CACHE_TTL = 300
 
 # ==============================================================================
@@ -341,8 +336,7 @@ class AdminBrain:
 
 class SQLiteDataMirror:
     def __init__(self):
-        # Saves to a local file that is overwritten on server restart
-        self.conn = sqlite3.connect("/tmp/erp_mirror.db", check_same_thread=False)
+        self.conn = sqlite3.connect(":memory:", check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.last_sync_map: dict = {}
         self._lock = asyncio.Lock()
@@ -424,7 +418,7 @@ class SQLiteDataMirror:
                         self.last_sync_map[module_key] = time.time()
                         return True
                 except Exception as e:
-                    logger.error(f"[Sync Error] {module_key}: {e}")
+                    print(f"[Sync Error] {module_key}: {e}")
                     return False
         return False
 
@@ -487,7 +481,7 @@ class RAGRetriever:
             cursor.execute(sql, params)
             return [dict(row) for row in cursor.fetchall()], columns
         except Exception as e:
-            logger.error(f"[SQL Error]: {e}")
+            print(f"[SQL Error] {e}")
             return [], columns
 
 
