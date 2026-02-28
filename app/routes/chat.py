@@ -7,7 +7,7 @@ import httpx
 router = APIRouter()
 
 # ==============================================================================
-# CONFIGURATION & SECURITY (100% Private & Offline)
+# CONFIGURATION & SECURITY 
 # ==============================================================================
 BASE_URL = "https://umbrellasales.xyz/umbrella-inventory-server"
 LOGIN_URL = f"{BASE_URL}/api/service/login"
@@ -18,7 +18,7 @@ LOGIN_PAYLOAD = {
 CACHE_TTL = 300 
 
 # ==============================================================================
-# 1. LOCAL TRANSLATION DICTIONARY (100% Offline)
+# 1. LOCAL TRANSLATION DICTIONARY
 # ==============================================================================
 LOCAL_INTENT_MAP = {
     "show": ["daakhva", "dakhav", "dakhva", "दाखवा", "दाखव", "dikhao", "dekhao"],
@@ -90,13 +90,19 @@ class SQLiteDataMirror:
         
         self.domain_profiles = {
             "Materials": "material materials fabric raw component item physical",
-            "Purchases": "purchase purchases order invoice receipt bought history",
-            "Supplier Credits": "supplier credit credits refund owe due balance payment",
+            "Purchases": "purchase purchases order bought buy",
+            "Supplier Credits": "supplier credit credits refund owe due payment",
             "Customers": "customer customers client buyer purchaser",
             "Suppliers": "supplier suppliers vendor distributor provider",
             "Supplier Ledger": "supplier ledger statement account balance sheet history",
-            "Product Stocks": "product stock stocks inventory quantity warehouse retail item available",
-            "Categories": "category categories type classification"
+            "Product Stocks": "product stock stocks inventory quantity warehouse retail item available barcode",
+            "Categories": "category categories type classification",
+            "Purchase History": "supplier purchase history historical timeline",
+            "Sells": "sell sells sold invoice sale sales retail dispatch",
+            "Printers": "printer printers active machine printing device",
+            "Email Configs": "email config emails configuration smtp mail",
+            "Customer Ledgers": "customer ledger ledgers account history",
+            "Supplier Payments": "payment payments paid settled history"
         }
         self.tfidf = LightweightTFIDF(self.domain_profiles)
 
@@ -124,7 +130,6 @@ class SQLiteDataMirror:
                 elif not isinstance(v, (list, dict)):
                     row_base[k] = v
                 elif isinstance(v, dict):
-                    # FIX: Safely extracts Invoice Numbers or Totals instead of dumping raw JSON
                     display_val = v.get("name", v.get("title", v.get("invoiceNo", v.get("totalAmount", "Attached Record"))))
                     row_base[k] = display_val
                 elif isinstance(v, list) and v and isinstance(v[0], dict):
@@ -182,7 +187,13 @@ class SQLiteDataMirror:
                     "Suppliers": "/api/supplier/get-all-suppliers",
                     "Supplier Ledger": "/api/reports/get-supplier-ledger",
                     "Product Stocks": "/api/reports/get-product-stocks-with-product",
-                    "Categories": "/api/reports/get-all-product-categories"
+                    "Categories": "/api/reports/get-all-product-categories",
+                    "Purchase History": "/api/reports/supplier-purchase-history",
+                    "Sells": "/api/sell/get-all-sells",
+                    "Printers": "/api/printer/get-all-printers",
+                    "Email Configs": "/api/email-config/get-all-emails",
+                    "Customer Ledgers": "/api/reports/get-all-customer-ledgers",
+                    "Supplier Payments": "/api/payment/supplier-payment-history"
                 }
                 
                 tasks = [client.get(f"{BASE_URL}{url}", headers=headers) for url in endpoints.values()]
@@ -201,11 +212,11 @@ class SQLiteDataMirror:
 db = SQLiteDataMirror()
 
 # ==============================================================================
-# 4. SEMANTIC SQL QUERY PLANNER
+# 4. SUPER INTELLIGENT QUERY PLANNER (ZERO RULES)
 # ==============================================================================
 class StructuredQueryPlanner:
     def __init__(self):
-        self.stopwords = {"show", "me", "find", "get", "what", "is", "are", "the", "a", "an", "of", "for", "please", "can", "you", "tell", "details", "all", "we", "have", "our", "available", "availlable", "availble", "names", "list", "give", "in", "any"}
+        self.stopwords = {"show", "me", "find", "get", "what", "is", "are", "the", "a", "an", "of", "for", "please", "can", "you", "tell", "details", "all", "we", "have", "our", "available", "availlable", "availble", "names", "list", "give", "in", "any", "by", "its", "their", "specific"}
 
     def execute_plan(self, query):
         clean_q = re.sub(r'[^a-zA-Z0-9\s-]', ' ', query.lower())
@@ -225,12 +236,38 @@ class StructuredQueryPlanner:
         if not columns or columns == ["Notice"]:
             return best_table, [], search_term
 
+        # --- DYNAMIC SCHEMA-AWARE COLUMN DETECTION (100% Rule-Free) ---
+        intent_words = ["highest", "lowest", "most", "least", "maximum", "minimum", "top"]
+        domain_keywords = db.domain_profiles[best_table].split()
+        
+        raw_filter_tokens = [w for w in search_term.split() if w not in intent_words]
+        final_filter_tokens = [w for w in raw_filter_tokens if w not in domain_keywords]
+        
+        prompt_column = None
+        
+        # Mathematically scan the actual API column names to see if the user mentioned one
+        for col in columns:
+            # Splits camelCase (e.g. 'invoiceNo' -> ['invoice', 'no'])
+            clean_col_words = re.sub(r"([a-z])([A-Z])", r"\1 \2", col).lower().split()
+            
+            for cw in clean_col_words:
+                if len(cw) > 2 and cw in query.lower():
+                    # Check if the user ONLY provided the column name, but gave no actual value
+                    remaining_value_tokens = [t for t in final_filter_tokens if t not in clean_col_words]
+                    if not remaining_value_tokens: 
+                        prompt_column = re.sub(r"([a-z])([A-Z])", r"\1 \2", col).title()
+                        break
+            if prompt_column:
+                break
+                
+        if prompt_column and not final_filter_tokens:
+            return best_table, [], f"PROMPT_MISSING_PARAM:{prompt_column}"
+
         sql_clauses = {"WHERE": [], "ORDER BY": "", "LIMIT": ""}
         
         limit_match = re.search(r'top\s+(\d+)', search_term)
         if limit_match:
             sql_clauses["LIMIT"] = f"LIMIT {limit_match.group(1)}"
-            search_term = re.sub(r'top\s+\d+', '', search_term)
 
         numeric_cols = [c for c in columns if any(kw in c.lower() for kw in ["price", "amount", "qty", "quantity", "stock", "total", "balance"])]
         if numeric_cols:
@@ -239,11 +276,11 @@ class StructuredQueryPlanner:
             elif any(w in search_term for w in ["lowest", "least", "minimum"]):
                 sql_clauses["ORDER BY"] = f'ORDER BY CAST("{numeric_cols[0]}" AS REAL) ASC'
 
-        intent_words = ["highest", "lowest", "most", "least", "maximum", "minimum", "top"]
-        raw_filter_tokens = [w for w in search_term.split() if w not in intent_words]
-        domain_keywords = db.domain_profiles[best_table].split()
-        final_filter_tokens = [w for w in raw_filter_tokens if w not in domain_keywords]
-        
+        # Safely remove the column names from the search string so we just search for the value
+        if prompt_column:
+            clean_col_words = prompt_column.lower().split()
+            final_filter_tokens = [w for w in final_filter_tokens if w not in clean_col_words]
+            
         filter_term = " ".join(final_filter_tokens).strip()
 
         if filter_term:
@@ -258,7 +295,6 @@ class StructuredQueryPlanner:
             params = [f"%{filter_term}%"] * len(columns)
             
         if sql_clauses["ORDER BY"]: base_sql += f' {sql_clauses["ORDER BY"]}'
-        
         if sql_clauses["LIMIT"]: base_sql += f' {sql_clauses["LIMIT"]}'
         elif not sql_clauses["WHERE"]: base_sql += ' LIMIT 10000'
 
@@ -280,19 +316,16 @@ class LLMStyleFormatter:
         if not records: return None, None
         sum_qty, sum_amount = 0.0, 0.0
         
-        # FIX: Strict Mathematical Calculation to prevent "Trillion Rupee" Double-Counting
         for rec in records:
-            # 1. Find ONE primary monetary value for this row
             amount_added = False
             for amt_key in ["totalAmount", "purchaseAmount", "creditAmount", "sellPrice"]:
                 actual_key = next((k for k in rec.keys() if k.lower() == amt_key.lower()), None)
                 if actual_key and not amount_added:
                     try:
                         sum_amount += float(str(rec[actual_key]).replace(',', ''))
-                        amount_added = True # Stop checking other amount columns to prevent double counting
+                        amount_added = True 
                     except ValueError: pass
 
-            # 2. Find ONE primary quantity value for this row
             qty_added = False
             for qty_key in ["stockQuantity", "quantity", "totalQuantity", "qty"]:
                 actual_key = next((k for k in rec.keys() if k.lower() == qty_key.lower()), None)
@@ -305,13 +338,16 @@ class LLMStyleFormatter:
         return sum_qty if sum_qty > 0 else None, sum_amount if sum_amount > 0 else None
 
     def create_human_response(self, domain, records, search_term):
+        if search_term.startswith("PROMPT_MISSING_PARAM:"):
+            missing_param = search_term.split(":")[1]
+            return f"Sure! I can look that up for you in the {domain} database. Could you please specify the **{missing_param}**?"
+
         if not domain or not records:
             return f"I've searched our **{domain}** records, but I couldn't find anything matching **'{search_term}'**. It's possible the database is empty or the specific item isn't logged yet."
 
         total_items = len(records)
         qty, amount = self._calculate_insights(records)
         
-        # FIX: More human-like, conversational phrasing
         ack = random.choice(["I've got that for you. ", "Certainly! ", "Here is the data you requested. ", "All set. "])
         
         if search_term:
@@ -336,7 +372,7 @@ class LLMStyleFormatter:
         for r in records: raw_keys.update(r.keys())
         visible_keys = [k for k in raw_keys if k not in {"id", "_id", "__v", "password", "jwtToken", "role", "permissions"}]
         
-        priority_keys = ["productName", "name", "firstName", "lastName", "supplierName", "supplier", "product", "customer", "materialName", "email", "phone", "stockQuantity", "sellPrice", "totalAmount"]
+        priority_keys = ["invoiceNo", "productName", "name", "firstName", "lastName", "supplierName", "supplier", "product", "customer", "materialName", "email", "phone", "contact", "stockQuantity", "sellPrice", "totalAmount"]
         headers = sorted(visible_keys, key=lambda x: priority_keys.index(x) if x in priority_keys else 99)
 
         html = "<div style='overflow-x:auto; margin-top:10px; border-radius:8px; box-shadow:0 4px 6px -1px rgba(0,0,0,0.1);'>"
@@ -385,7 +421,6 @@ async def chat_endpoint(request: ChatRequest):
     if q_lower in ["thank you", "thanks", "awesome", "perfect"]:
         return {"response": random.choice(["You're very welcome! Let me know if you need any other reports.", "My pleasure! I'm here if you need more data."])}
 
-    # FIX: Robust Greeting Detection (catches "heyy", "heya", "hello there", etc.)
     greet_words = ["hi", "hello", "hey", "heyy", "heya", "good morning", "good afternoon"]
     if any(q_lower.startswith(g) for g in greet_words) and len(q_lower.split()) <= 3:
         return {"response": "Hello! I am your AI Operations Assistant. You can ask me to analyze inventory, find specific purchase invoices, or check supplier credits. How can I help you today?"}
