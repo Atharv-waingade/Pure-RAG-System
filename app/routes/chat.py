@@ -126,7 +126,7 @@ CORS_ORIGINS: List[str] = (
 )
 if CORS_ORIGINS == ["*"]:
     log.warning("CORS_ORIGINS not set — defaulting to '*'. "
-                "Set CORS_ORIGINS=https://yourapp.com in production!")
+                "Set CORS_ORIGINS=https://pure-rag-system.onrender.com/chat")
 
 SECURITY_HEADERS = {
     "X-Content-Type-Options":  "nosniff",
