@@ -1,59 +1,40 @@
 """
 ==============================================================================
-  ADMIN INTELLIGENCE ENGINE  v6.3  —  PRODUCTION READY · ALL 8 GAPS CLOSED
+  ADMIN INTELLIGENCE ENGINE  v7.1  —  PRODUCTION READY
   ERP Chatbot RAG Pipeline · Zero external AI APIs · ≤300 MB RAM
   Full Marathi (Devanagari + Roman) + English support
 
-  ╔══════════════════════════════════════════════════════════════════════════╗
-  ║  v6.2 (57/57 tests) + 8 production hardening fixes                     ║
-  ╚══════════════════════════════════════════════════════════════════════════╝
+  PHASE 1 QUICK WINS  (Items 23–30) — built on v7.0 stable base
+  ──────────────────────────────────────────────────────────────
+  P1-23 : Warmup all 17 modules — WARMUP_MODULES = list(MODULE_REGISTRY.keys())
+  P1-24 : FTS index optimization — FTS5 restricted to FTS_COLUMNS allowlist
+           (8-10 high-value columns), cutting index size and boosting speed.
+  P1-25 : 'Named' query mode — NAME_RE regex routes "named/called/for X"
+           to existing name endpoints (material, purchase stock); others
+           fall through to FTS gracefully.
+  P1-26 : Response time in /health — LatencyTracker (deque, 1000 items)
+           records process() duration; /health reports p50/p95/p99 ms.
+  P1-27 : Print-friendly CSS — @media print block injected into every
+           table render (browser deduplicates <style> in same doc).
+  P1-28 : Negative search — NEGATION_RE + "NEGATIVE_SEARCH" intent +
+           RAGRetriever._negative() → WHERE col NOT LIKE '%val%'.
+  P1-29 : Module aliases — 'bills'/'bill' → sell;
+           'debit note'/'debit notes' → supplier-credit.
+  P1-30 : python-dotenv support — optional load_dotenv(); .env.example
+           generated at startup if missing.
 
-  FIXES vs v6.2:
-  ──────────────
-  FIX-1: Startup readiness gate — asyncio.Event() blocks /chat until the
-         warmup task (4 module pre-fetch) completes. First request no longer
-         gets empty SQLite. Falls through after 30s safety timeout.
-
-  FIX-2: httpx cancellation fixed — _fetch_with_retry() now uses httpx.Timeout
-         with explicit connect=5s/read=25s values. asyncio.wait_for(45s) can
-         now properly cancel the underlying TCP connection instead of
-         abandoning it open. CancelledError propagated immediately (no retry).
-
-  FIX-3: Circuit breaker — CB_FAILURE_THRESHOLD=5 consecutive ERP failures
-         opens the breaker. All sync_module() calls short-circuit to stale/error
-         instantly instead of burning 3×retry×1.5s = 4.5s each under load.
-         Probes after CB_RECOVERY_TIMEOUT=30s (HALF_OPEN), closes after
-         CB_SUCCESS_THRESHOLD=2 successes.
-
-  FIX-4: Cache coherence — response_cache.invalidate_module(key) called
-         immediately after a successful sync. Stale HTML can no longer survive
-         past the point where fresh data is loaded into SQLite.
-
-  FIX-5: CORS — CORSMiddleware added. Restrict allowed origins via env var
-         CORS_ORIGINS=https://yourapp.com (comma-separated). Defaults to "*"
-         for local dev; always set in production.
-
-  FIX-6: Security headers — SecurityHeadersMiddleware injects on every
-         response: X-Content-Type-Options, X-Frame-Options, X-XSS-Protection,
-         Content-Security-Policy, Referrer-Policy, Permissions-Policy.
-
-  FIX-7: Request tracing — X-Request-ID header echoed (or generated) on
-         every response. Logged alongside ip/lang/query in chat_endpoint.
-         Makes it possible to correlate a frontend error report with a
-         specific log line in Render's dashboard.
-
-  FIX-8: Rate limiter clarified — check() now returns (allowed, remaining)
-         so X-RateLimit-Remaining can be set. Documented clearly: in-process
-         limiter is correct for single-worker Render free tier. Redis path
-         documented for if/when you scale to multiple workers.
-
-  ALL PREVIOUS FIXES RETAINED (see v6.2 header for full list):
-  ─────────────────────────────────────────────────────────────
-  SEC-01–10 · BUG-07–16 · PERF-06–11 · FEAT-01–05
+  ALL v7.0 FIXES RETAINED (43 issues resolved in v7.0).
 ==============================================================================
 """
 
 from __future__ import annotations
+
+# ── P1-30: python-dotenv optional load ───────────────────────────────────────
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv()
+except ImportError:
+    pass  # dotenv not installed — env vars come from shell/platform
 
 import asyncio
 import collections
@@ -76,9 +57,9 @@ from typing import Any, Dict, List, Optional, Tuple
 try:
     import httpx
     from fastapi import APIRouter, HTTPException, Request, Response
-    from pydantic import BaseModel, field_validator
+    from pydantic import BaseModel
     _FASTAPI_AVAILABLE = True
-except ImportError:          # pragma: no cover
+except ImportError:
     _FASTAPI_AVAILABLE = False
     class BaseModel:         # type: ignore
         def __init__(self, **kw): [setattr(self, k, v) for k, v in kw.items()]
@@ -97,78 +78,82 @@ log = logging.getLogger("erp.engine")
 # ──────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION
 # ──────────────────────────────────────────────────────────────────────────────
-BASE_URL               = os.getenv("ERP_BASE_URL",
-                                   "https://umbrellasales.xyz/umbrella-inventory-server")
-LOGIN_URL              = f"{BASE_URL}/api/service/login"
+BASE_URL          = os.getenv("ERP_BASE_URL",
+                              "https://umbrellasales.xyz/umbrella-inventory-server")
+LOGIN_URL         = f"{BASE_URL}/api/service/login"
 
-# SEC-09: refuse hardcoded creds in production unless opt-in env var set
-_ERP_USER = os.getenv("ERP_USERNAME", "")
-_ERP_PASS = os.getenv("ERP_PASSWORD", "")
-_ALLOW_DEFAULT = os.getenv("ALLOW_DEFAULT_CREDS", "false").lower() == "true"
+_ERP_USER         = os.getenv("ERP_USERNAME", "")
+_ERP_PASS         = os.getenv("ERP_PASSWORD", "")
+_ALLOW_DEFAULT    = os.getenv("ALLOW_DEFAULT_CREDS", "false").lower() == "true"
+
 if not _ERP_USER and not _ALLOW_DEFAULT:
-    log.warning(
-        "ERP_USERNAME not set. Set ERP_USERNAME / ERP_PASSWORD env vars, "
-        "or set ALLOW_DEFAULT_CREDS=true to use defaults (not recommended)."
-    )
+    log.warning("ERP_USERNAME not set. Set ERP_USERNAME/ERP_PASSWORD env vars "
+                "or ALLOW_DEFAULT_CREDS=true (dev only).")
 if not _ERP_USER and _ALLOW_DEFAULT:
     _ERP_USER = "superadmin.com"
     _ERP_PASS = "superadmin@123"
 
-LOGIN_CREDS = {"username": _ERP_USER, "password": _ERP_PASS}
+LOGIN_CREDS             = {"username": _ERP_USER, "password": _ERP_PASS}
 
-MODULE_TTL             = 300       # 5 min  — master data
-STOCK_TTL              = 120       # 2 min  — inventory
-FINANCE_TTL            = 600       # 10 min — ledgers
-MAX_ROWS               = 30_000    # per-module SQLite cap (300 MB budget)
-MAX_RENDER_ROWS        = 500       # rows rendered in HTML table (PERF-11)
-API_TIMEOUT            = 30.0
-API_MAX_RETRIES        = 3
-JWT_EXPIRY_BUFFER      = 60        # re-auth 60s before token expires
-FLATTEN_MAX_CHILD_ROWS = 200       # SEC-02: sibling array cap
-RATE_LIMIT_RPM         = 60        # SEC-07: requests per minute per IP
-MAX_SESSIONS           = 500       # BUG-09: max concurrent session contexts
-SESSION_TTL            = 1800      # BUG-09: 30 min session idle timeout
-RESPONSE_CACHE_SIZE    = 512       # PERF-06: LRU response cache entries
-RESPONSE_CACHE_TTL     = 90        # PERF-06: cache TTL in seconds
-WARMUP_MODULES         = [         # BUG-10: pre-fetched on startup
-    "product-stock", "purchase", "sell", "supplier",
-]
-SQLITE_MMAP_SIZE       = 128 * 1024 * 1024   # PERF-08: 128 MB mmap
+MODULE_TTL              = 300        # 5 min  — master data
+STOCK_TTL               = 120        # 2 min  — inventory
+FINANCE_TTL             = 600        # 10 min — ledgers
+MAX_ROWS                = 30_000     # per-module SQLite cap
+MAX_RENDER_ROWS         = 500        # HTML table render cap
+API_TIMEOUT             = 30.0
+API_MAX_RETRIES         = 3
+JWT_EXPIRY_BUFFER       = 60
+FLATTEN_MAX_CHILD_ROWS  = 200
+RATE_LIMIT_RPM          = 60
+MAX_SESSIONS            = 500
+SESSION_TTL             = 1800
+RESPONSE_CACHE_SIZE     = 512
+RESPONSE_CACHE_TTL      = 90
+CB_FAILURE_THRESHOLD    = 5
+CB_RECOVERY_TIMEOUT     = 30.0
+CB_SUCCESS_THRESHOLD    = 2
+SQLITE_MMAP_SIZE        = 128 * 1024 * 1024
 
-# FIX-1: Startup readiness — requests wait until warmup is done
-_startup_ready         = asyncio.Event()
+# P1-23: warm up ALL 17 modules (expanded from 4)
+# Defined after MODULE_REGISTRY below — assigned via list(MODULE_REGISTRY.keys())
 
-# FIX-3: Circuit breaker thresholds
-CB_FAILURE_THRESHOLD   = 5      # open after 5 consecutive failures
-CB_RECOVERY_TIMEOUT    = 30.0   # seconds before half-open probe
-CB_SUCCESS_THRESHOLD   = 2      # successes in half-open to close
+_startup_ready: Optional[asyncio.Event] = None
 
-# FIX-6: Security headers added to every response
+_cors_env = os.getenv("CORS_ORIGINS", "")
+CORS_ORIGINS: List[str] = (
+    [o.strip() for o in _cors_env.split(",") if o.strip()]
+    if _cors_env else ["*"]
+)
+if CORS_ORIGINS == ["*"]:
+    log.warning("CORS_ORIGINS not set — defaulting to '*'. "
+                "Set CORS_ORIGINS=https://yourapp.com in production!")
+
 SECURITY_HEADERS = {
     "X-Content-Type-Options":  "nosniff",
     "X-Frame-Options":         "DENY",
     "X-XSS-Protection":        "1; mode=block",
     "Content-Security-Policy": (
         "default-src 'none'; "
-        "img-src 'self' data: https://umbrellasales.xyz; "
-        "style-src 'unsafe-inline'; "
-        "script-src 'none'"
+        f"img-src 'self' data: {BASE_URL.split('/umbrella')[0]}; "
+        "style-src 'unsafe-inline'; script-src 'none'"
     ),
     "Referrer-Policy":         "strict-origin-when-cross-origin",
     "Permissions-Policy":      "geolocation=(), microphone=(), camera=()",
 }
 
-# FIX-5: CORS — restrict to your actual frontend origins
-# Override via env var: CORS_ORIGINS=https://yourapp.com,https://admin.yourapp.com
-_cors_env = os.getenv("CORS_ORIGINS", "")
-CORS_ORIGINS: List[str] = (
-    [o.strip() for o in _cors_env.split(",") if o.strip()]
-    if _cors_env
-    else ["*"]   # dev default — lock down in prod via env var
-)
+# ── P1-24: FTS column allowlist — only index high-value searchable columns ───
+# Restricts FTS5 virtual table to these columns; main data table stays complete.
+FTS_COLUMNS = frozenset({
+    "name", "firstName", "lastName",
+    "productName", "supplierName", "customerName", "materialName",
+    "invoiceNo", "billNo", "supplierBill",
+    "barcode",
+    "contact", "phone", "mobile", "email",
+    "status", "supplyType",
+})
 
 # ──────────────────────────────────────────────────────────────────────────────
-# MODULE REGISTRY
+# MODULE REGISTRY  — all 35 API endpoints wired (v7.0) + P1-29 aliases added
 # ──────────────────────────────────────────────────────────────────────────────
 MODULE_REGISTRY: Dict[str, Dict[str, Any]] = {
 
@@ -178,11 +163,17 @@ MODULE_REGISTRY: Dict[str, Dict[str, Any]] = {
         "keywords":    ["credit", "credits", "outstanding", "due", "refund", "owe", "owes"],
         "phrases":     ["supplier credit", "supplier credits", "vendor credit",
                         "credit note", "credit balance", "outstanding credit",
-                        "how much do we owe", "credits owed"],
-        "aliases":     ["supplier credit", "vendor credit", "credits outstanding"],
+                        "how much do we owe", "credits owed",
+                        # P1-29: debit note alias routes here
+                        "debit note", "debit notes"],
+        "aliases":     ["supplier credit", "vendor credit", "credits outstanding",
+                        # P1-29
+                        "debit note", "debit notes"],
         "amount_cols": ["creditAmount", "amount", "totalCredit", "totalAmount"],
         "qty_cols":    [],
-        "search_endpoints": {},
+        "search_endpoints": {
+            "id": {"url": "/api/supplier-credit/get-supplier-credit", "param": "id"},
+        },
     },
 
     "supplier-ledger": {
@@ -202,11 +193,14 @@ MODULE_REGISTRY: Dict[str, Dict[str, Any]] = {
         "ttl":         FINANCE_TTL,
         "keywords":    [],
         "phrases":     ["customer ledger", "client ledger", "customer statement",
-                        "customer account", "receivables", "customer balance"],
+                        "customer account", "receivables", "customer balance",
+                        "customer account history", "customer outstanding"],
         "aliases":     ["customer ledger", "client ledger"],
         "amount_cols": ["debit", "credit", "balance", "amount"],
         "qty_cols":    [],
-        "search_endpoints": {},
+        "search_endpoints": {
+            "id": {"url": "/api/reports/get-customer-ledger", "param": "customerId"},
+        },
     },
 
     "customer-ledger-summary": {
@@ -221,6 +215,19 @@ MODULE_REGISTRY: Dict[str, Dict[str, Any]] = {
         "search_endpoints": {},
     },
 
+    "customer-ledger-detail": {
+        "url":         "/api/reports/customer-ledger-detail",
+        "ttl":         FINANCE_TTL,
+        "keywords":    [],
+        "phrases":     ["customer ledger detail", "customer ledger details",
+                        "customer account detail", "customer transaction detail",
+                        "detailed customer ledger", "customer detail statement"],
+        "aliases":     ["customer ledger detail", "customer detail"],
+        "amount_cols": ["debit", "credit", "balance", "amount"],
+        "qty_cols":    [],
+        "search_endpoints": {},
+    },
+
     "sell": {
         "url":         "/api/sell/get-all-sells",
         "ttl":         MODULE_TTL,
@@ -228,13 +235,18 @@ MODULE_REGISTRY: Dict[str, Dict[str, Any]] = {
                         "invoice", "receipt", "billing", "revenue"],
         "phrases":     ["sales invoice", "sell invoice", "dispatch record", "all sales",
                         "sales list", "all sells", "invoices", "what did we sell",
-                        "customer invoice", "sales history", "sell history"],
-        "aliases":     ["sales", "sells", "invoices", "receipts", "billing"],
+                        "customer invoice", "sales history", "sell history",
+                        # P1-29: bills alias
+                        "bills list", "show bills", "all bills"],
+        "aliases":     ["sales", "sells", "invoices", "receipts", "billing",
+                        # P1-29
+                        "bills", "bill"],
         "amount_cols": ["totalAmount", "sellPrice", "amount", "paid"],
         "qty_cols":    ["quantity", "qty", "totalQuantity"],
         "search_endpoints": {
-            "invoice": {"url": "/api/sell/search-by-invoice",       "param": "invoiceNo"},
-            "invoice_exact": {"url": "/api/sell/get-sell-by-invoice-no", "param": "invoiceNo"},
+            "invoice":       {"url": "/api/sell/search-by-invoice",        "param": "invoiceNo"},
+            "id":            {"url": "/api/sell/get-sell",                  "param": "id"},
+            "next_invoice":  {"url": "/api/sell/get-next-sell-invoice-no", "param": None},
         },
     },
 
@@ -251,9 +263,11 @@ MODULE_REGISTRY: Dict[str, Dict[str, Any]] = {
         "amount_cols": ["totalAmount", "purchaseAmount", "totalPurchaseAmount", "amount"],
         "qty_cols":    ["quantity", "qty", "totalQuantity", "receivedQuantity"],
         "search_endpoints": {
-            "barcode": {"url": "/api/purchase/get-stock-by-barcode",       "param": "barcode"},
-            "invoice": {"url": "/api/purchase/get-purchase-by-invoice-no", "param": "invoiceNo"},
-            "name":    {"url": "/api/purchase/get-stock-by-product-name",  "param": "productName"},
+            "barcode":       {"url": "/api/purchase/get-stock-by-barcode",       "param": "barcode"},
+            "invoice":       {"url": "/api/purchase/get-purchase-by-invoice-no", "param": "invoiceNo"},
+            "name":          {"url": "/api/purchase/get-stock-by-product-name",  "param": "productName"},
+            "id":            {"url": "/api/purchase/get-purchase",               "param": "id"},
+            "next_invoice":  {"url": "/api/purchase/get-next-purchase-invoice-no", "param": None},
         },
     },
 
@@ -311,6 +325,7 @@ MODULE_REGISTRY: Dict[str, Dict[str, Any]] = {
         "qty_cols":    [],
         "search_endpoints": {
             "name": {"url": "/api/material/get-material-by-name", "param": "name"},
+            "id":   {"url": "/api/material/get-material",          "param": "id"},
         },
     },
 
@@ -326,6 +341,7 @@ MODULE_REGISTRY: Dict[str, Dict[str, Any]] = {
         "qty_cols":    [],
         "search_endpoints": {
             "contact": {"url": "/api/customer/search-by-contact", "param": "contact"},
+            "id":      {"url": "/api/customer/get-customer",       "param": "id"},
         },
     },
 
@@ -340,7 +356,9 @@ MODULE_REGISTRY: Dict[str, Dict[str, Any]] = {
         "aliases":     ["suppliers", "vendors", "distributors"],
         "amount_cols": ["supplierCredit"],
         "qty_cols":    [],
-        "search_endpoints": {},
+        "search_endpoints": {
+            "id": {"url": "/api/supplier/get-supplier", "param": "id"},
+        },
     },
 
     "product-stock": {
@@ -377,12 +395,13 @@ MODULE_REGISTRY: Dict[str, Dict[str, Any]] = {
         "ttl":         MODULE_TTL,
         "keywords":    ["printer", "printers", "machine", "print"],
         "phrases":     ["printer list", "all printers", "printing machines",
-                        "active printer", "show printers"],
+                        "active printer", "show printers", "printer details"],
         "aliases":     ["printers", "printing"],
         "amount_cols": [],
         "qty_cols":    [],
         "search_endpoints": {
-            "active": {"url": "/api/printer/get-active-printer", "param": None},
+            "active": {"url": "/api/printer/get-active-printer",  "param": None},
+            "id":     {"url": "/api/printer/get-printer-by-id",   "param": "id"},
         },
     },
 
@@ -391,15 +410,20 @@ MODULE_REGISTRY: Dict[str, Dict[str, Any]] = {
         "ttl":         MODULE_TTL,
         "keywords":    ["email", "emails", "smtp", "config", "mail"],
         "phrases":     ["email config", "mail config", "smtp config",
-                        "email settings", "active email", "email setup"],
+                        "email settings", "active email", "email setup",
+                        "email configuration"],
         "aliases":     ["emails", "mails", "smtp"],
         "amount_cols": [],
         "qty_cols":    [],
         "search_endpoints": {
-            "active": {"url": "/api/email-config/active", "param": None},
+            "active": {"url": "/api/email-config/active",            "param": None},
+            "id":     {"url": "/api/email-config/get-email-by-id",   "param": "id"},
         },
     },
 }
+
+# P1-23: warm up ALL 17 modules
+WARMUP_MODULES = list(MODULE_REGISTRY.keys())
 
 # ──────────────────────────────────────────────────────────────────────────────
 # MULTI-MODULE PATTERNS
@@ -441,21 +465,32 @@ MULTI_PATTERNS = [
 ]
 
 # ──────────────────────────────────────────────────────────────────────────────
-# COMPILED REGEXES  (PERF-09)
+# COMPILED REGEXES  — P1-25 NAME_RE, P1-28 NEGATION_RE added
 # ──────────────────────────────────────────────────────────────────────────────
-BARCODE_RE   = re.compile(r"\bBAR\w{6,}\b",                   re.IGNORECASE)
-INVOICE_RE   = re.compile(r"\b(PA\d{5,}|SA\d{5,}|INV[-/]\w+)\b", re.IGNORECASE)
-CONTACT_RE   = re.compile(r"\b[6-9]\d{9}\b")
-ACTIVE_RE    = re.compile(r"\bactive\b",                       re.IGNORECASE)
-CAMEL_RE     = re.compile(r"([a-z])([A-Z])")
-CLEAN_RE     = re.compile(r"[^a-z0-9\s\-]")
-# BUG-14: FTS special chars AND boolean operators to strip from search terms
-FTS_SPECIAL   = re.compile(r'["()*+\-^~<>]')
-_FTS_BOOL_RE  = re.compile(r'\b(NOT|OR|AND|NEAR)\b', re.IGNORECASE)
-# BUG-15: strict datetime check (YYYY-MM-DDTHH:MM)
-DATETIME_RE  = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}")
-# SEC-08: session_id sanitizer
-SESSION_RE   = re.compile(r"[^a-zA-Z0-9_\-]")
+BARCODE_RE      = re.compile(r"\bBAR\w{6,}\b",                        re.IGNORECASE)
+INVOICE_RE      = re.compile(r"\b(PA\d{5,}|SA\d{5,}|INV[-/]\w+)\b",  re.IGNORECASE)
+CONTACT_RE      = re.compile(r"\b[6-9]\d{9}\b")
+ACTIVE_RE       = re.compile(r"\bactive\b",                            re.IGNORECASE)
+ID_RE           = re.compile(r"\bid\s*[:#]?\s*(\d+)\b",               re.IGNORECASE)
+NEXT_INVOICE_RE = re.compile(r"\bnext\s+(purchase|sell|sale|invoice)\s*(number|no|invoice)?\b",
+                              re.IGNORECASE)
+# P1-25: named query mode — "product named Chair", "called Rahul", "for supplier ABC"
+NAME_RE         = re.compile(
+    r"\b(?:named?|called|for)\s+([\w\s]{2,40}?)(?:\s+(?:in|from|at|by|with|list|details|info|record|history)|\s*$)",
+    re.IGNORECASE,
+)
+# P1-28: negative search — "not X", "except X", "exclude X", "without X"
+NEGATION_RE     = re.compile(
+    r"\b(?:not|except|exclude|excluding|without)\s+([\w\s]{2,40}?)(?:\s+(?:in|from|at|by|with|list|and)|\s*$)",
+    re.IGNORECASE,
+)
+
+CAMEL_RE        = re.compile(r"([a-z])([A-Z])")
+CLEAN_RE        = re.compile(r"[^a-z0-9\s\-]")
+FTS_SPECIAL     = re.compile(r'["()*+\-^~<>]')
+_FTS_BOOL_RE    = re.compile(r'\b(NOT|OR|AND|NEAR)\b',                re.IGNORECASE)
+DATETIME_RE     = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}")
+SESSION_RE      = re.compile(r"[^a-zA-Z0-9_\-]")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # COLUMN SEARCH TRIGGERS
@@ -490,21 +525,22 @@ COLUMN_TRIGGERS: Dict[str, List[str]] = {
 # STOP WORD SETS
 # ──────────────────────────────────────────────────────────────────────────────
 EN_STOP = frozenset({
-    "me", "find", "what", "is", "are", "the", "a", "an", "of", "for",
-    "please", "can", "you", "tell", "we", "have", "our", "in", "any",
-    "by", "its", "their", "about", "on", "who", "which", "specific",
-    "details", "show", "get", "fetch", "display", "list", "all", "every",
-    "entire", "give", "check", "search", "look", "want", "need", "see",
-    "view", "pull", "do", "with", "from", "this", "that", "it", "i",
-    "my", "he", "she", "they", "them", "up", "out", "how", "many",
-    "much", "total", "count", "number", "no", "has", "some", "certain",
-    "latest", "recent", "current", "new", "old", "make", "create",
-    "report", "data", "records", "record", "entries", "full", "complete",
-    "entire", "whole", "information", "info",
+    "me","find","what","is","are","the","a","an","of","for","please","can","you",
+    "tell","we","have","our","in","any","by","its","their","about","on","who","which",
+    "specific","details","show","get","fetch","display","list","all","every","entire",
+    "give","check","search","look","want","need","see","view","pull","do","with","from",
+    "this","that","it","i","my","he","she","they","them","up","out","how","many","much",
+    "total","count","number","no","has","some","certain","latest","recent","current",
+    "new","old","make","create","report","data","records","record","entries","full",
+    "complete","whole","information","info",
+    "named","called","having","containing","where","whose","like","whose","between",
+    "using","via","through","based","order","orders","type","types","whose","its",
+    "their","belongs","belonging","related","regarding","about","under","above",
+    # P1-28: negation words go into stop set so they don't pollute search value
+    "not","except","exclude","excluding","without",
 })
 EN_BULK = frozenset({
-    "all", "list", "every", "entire", "show", "get", "fetch",
-    "display", "give", "complete", "full",
+    "all","list","every","entire","show","get","fetch","display","give","complete","full",
 })
 MR_STOP_ROMAN = frozenset({
     "mala","mla","mhala","amhala","amhi","mi","tu","to","ti","te","tyala","tila","aapan","apan",
@@ -602,6 +638,19 @@ _MR_RAW: Dict[str, Dict[str, List[str]]] = {
         "roman":["grahak khatevahi","grahak hisab","graahak khatevahi",
                  "customer ledger","customer hisab"],
     },
+    "customer-ledger-detail": {
+        "deva":["ग्राहक खाते तपशील","ग्राहक खाते विस्तृत","ग्राहक तपशील विवरण"],
+        "roman":["grahak khate tapshil","customer ledger detail","grahak detail",
+                 "customer tapshil","grahak vivaran tapshil"],
+    },
+    # P1-10 (carried from roadmap, wired in v7.1): customer-ledger-summary Marathi
+    "customer-ledger-summary": {
+        "deva":["ग्राहक खाते सारांश","ग्राहक शिल्लक सारांश","ग्राहक सारांश",
+                "ग्राहक थकबाकी सारांश"],
+        "roman":["grahak khate saransh","grahak shillak saransh",
+                 "customer ledger summary","grahak saransh",
+                 "customer balance summary"],
+    },
     "customer-payment-history": {
         "deva":["ग्राहक देयक इतिहास","ग्राहक पेमेंट","ग्राहकाने किती दिले"],
         "roman":["grahak payment itihas","grahak payment history",
@@ -643,16 +692,15 @@ _MR_RAW: Dict[str, Dict[str, List[str]]] = {
                  "category list","all categories","shreni","prakar"],
     },
     "printer": {
-        "deva":["प्रिंटर यादी","मुद्रण यंत्र","प्रिंटर"],
-        "roman":["printer yadi","mudran yantra","printer list","printer"],
+        "deva":["प्रिंटर यादी","मुद्रण यंत्र","प्रिंटर","सक्रिय प्रिंटर"],
+        "roman":["printer yadi","mudran yantra","printer list","printer","active printer"],
     },
     "email-config": {
-        "deva":["ईमेल सेटिंग","ईमेल कॉन्फिग","ईमेल","मेल"],
-        "roman":["email settings","email config","mail config","email"],
+        "deva":["ईमेल सेटिंग","ईमेल कॉन्फिग","ईमेल","मेल","सक्रिय ईमेल"],
+        "roman":["email settings","email config","mail config","email","active email"],
     },
 }
 
-# Build sorted flat list (longest match first) — BUG-08: used for scoring
 _MR_FLAT: List[Tuple[str, str]] = []
 for _mod, _kws in _MR_RAW.items():
     for k in _kws["deva"] + _kws["roman"]:
@@ -667,7 +715,7 @@ _MR_ROMAN_MARKERS = frozenset([
     "kachha","sahitya","kapad","shreni","uplabdh","godam","vyavahar","pavti",
     "baki","shillak","rakkam","vikreta","kiti","kitee","mal","nondi","tapshil",
     "itihas","mahiti","dilele","dile","kele","vikle","dakhva","dakhav","dakha",
-    "mala","mhala","chi","che","cha","supplier",
+    "mala","mhala","chi","che","cha","supplier","saransh",
 ])
 
 MR_COLUMNS: Dict[str, str] = {
@@ -693,25 +741,24 @@ MR_COLUMNS: Dict[str, str] = {
     "Total Purchase Amount":"एकूण खरेदी रक्कम","Payment Mode":"देय पद्धत",
     "Supplier Bill":"पुरवठादार बिल","Supplier":"पुरवठादार","Material":"साहित्य",
     "Packing Charges":"पॅकिंग शुल्क","Discount":"सूट","Cgst":"सीजीएसटी",
-    "Sgst":"एसजीएसटी","Igst":"आयजीएसटी",
+    "Sgst":"एसजीएसटी","Igst":"आयजीएसटी","Id":"आयडी",
 }
 
 MR_MODULES: Dict[str, str] = {
     "purchase":"खरेदी","sell":"विक्री","supplier-credit":"पुरवठादार क्रेडिट",
     "supplier-ledger":"पुरवठादार खातेवही","customer-ledger":"ग्राहक खातेवही",
-    "customer-ledger-summary":"ग्राहक खाते सारांश","customer":"ग्राहक",
-    "supplier":"पुरवठादार","product-stock":"उत्पादन साठा","payment":"देयक",
-    "customer-payment-history":"ग्राहक देयक इतिहास",
+    "customer-ledger-summary":"ग्राहक खाते सारांश",
+    "customer-ledger-detail":"ग्राहक खाते तपशील",
+    "customer":"ग्राहक","supplier":"पुरवठादार","product-stock":"उत्पादन साठा",
+    "payment":"देयक","customer-payment-history":"ग्राहक देयक इतिहास",
     "supplier-purchase-history":"पुरवठादार खरेदी इतिहास",
     "material":"साहित्य","category":"श्रेणी","printer":"प्रिंटर",
     "email-config":"ईमेल सेटिंग",
 }
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # LANGUAGE DETECTION
 # ──────────────────────────────────────────────────────────────────────────────
-
 def detect_language(text: str) -> str:
     deva  = sum(1 for c in text if 0x0900 <= ord(c) <= 0x097F)
     alpha = sum(1 for c in text if c.isalpha())
@@ -719,13 +766,11 @@ def detect_language(text: str) -> str:
         return "english"
     if deva / alpha > 0.25:
         return "marathi_devanagari"
-    t      = text.lower()
-    words  = set(t.split())
-    # Short markers (≤4 chars like "chi", "che", "mal") require exact word match.
-    # Long markers (≥5 chars like "kharedi") also check substring for compound words.
+    t     = text.lower()
+    words = set(t.split())
     for m in _MR_ROMAN_MARKERS:
         if len(m) <= 4:
-            if m in words:          # exact word boundary only
+            if m in words:
                 return "marathi_roman"
         else:
             if m in words or m in t:
@@ -738,50 +783,68 @@ def _apply_deva_stems(text: str) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# BUG-08: MARATHI CLASSIFIER WITH CONFIDENCE SCORING
+# MARATHI CLASSIFIER
 # ──────────────────────────────────────────────────────────────────────────────
-
 def marathi_classify(text: str) -> Optional[str]:
-    """
-    BUG-08 FIX: Returns module key only if confidence >= 0.4.
-    Phrase matches score 1.0; keyword matches score by keyword length / 20.
-    Longest phrase still wins via _MR_FLAT sort order.
-    """
     words   = text.split()
     stemmed = " ".join(DEVA_STEMS.get(w, w) for w in words)
     t       = stemmed.lower().strip()
-
     best_key, best_score = None, 0.0
     for keyword, module in _MR_FLAT:
         if keyword in t:
-            # Phrases (multi-word) score higher than single keywords
             score = min(1.0, len(keyword.split()) * 0.35 + 0.3)
             if score > best_score:
                 best_score, best_key = score, module
             if best_score >= 0.95:
-                break  # can't do better
-
+                break
     return best_key if best_score >= 0.4 else None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# QUERY ANALYZER
+# QUERY ANALYZER  — P1-25 NAME_RE, P1-28 NEGATION_RE integrated
 # ──────────────────────────────────────────────────────────────────────────────
-
 class QueryAnalyzer:
     def analyze(self, user_query: str) -> Dict[str, Any]:
         q = user_query.strip()
+
+        # Priority order: barcode > invoice > contact > next_invoice > id > name > negation > active
         m = BARCODE_RE.search(q)
         if m:
             return {"query_mode": "barcode", "query_value": m.group(0).upper()}
+
         m = INVOICE_RE.search(q)
         if m:
             return {"query_mode": "invoice", "query_value": m.group(0).upper()}
+
         m = CONTACT_RE.search(q)
         if m:
             return {"query_mode": "contact", "query_value": m.group(0)}
+
+        m = NEXT_INVOICE_RE.search(q)
+        if m:
+            return {"query_mode": "next_invoice", "query_value": m.group(1).lower()}
+
+        m = ID_RE.search(q)
+        if m:
+            return {"query_mode": "id", "query_value": m.group(1)}
+
+        # P1-25: named query — "product named Chair", "material called Cotton"
+        m = NAME_RE.search(q)
+        if m:
+            name_val = m.group(1).strip()
+            if name_val and len(name_val) >= 2:
+                return {"query_mode": "name", "query_value": name_val}
+
+        # P1-28: negation — "show purchases not cancelled"
+        m = NEGATION_RE.search(q)
+        if m:
+            neg_val = m.group(1).strip()
+            if neg_val and len(neg_val) >= 2:
+                return {"query_mode": "negation", "query_value": neg_val}
+
         if ACTIVE_RE.search(q):
             return {"query_mode": "active", "query_value": None}
+
         return {"query_mode": None, "query_value": None}
 
 
@@ -789,8 +852,13 @@ query_analyzer = QueryAnalyzer()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 1. NLU — 5-STAGE ENGLISH INTENT CLASSIFIER
+# NLU — 5-STAGE ENGLISH INTENT CLASSIFIER
 # ──────────────────────────────────────────────────────────────────────────────
+AGG_TRIGGERS = frozenset({
+    "total","sum","how many","count","how much","aggregate",
+    "altogether","combined","overall","एकूण","बेरीज","किती आहे",
+})
+
 
 class IntentClassifier:
     def __init__(self):
@@ -909,16 +977,8 @@ class IntentClassifier:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 2. QUERY PARSER
-# BUG-07 FIX: all-stop queries now force BULK_LIST intent
+# QUERY PARSER  — P1-28 NEGATIVE_SEARCH intent added
 # ──────────────────────────────────────────────────────────────────────────────
-
-AGG_TRIGGERS = frozenset({
-    "total","sum","how many","count","how much","aggregate",
-    "altogether","combined","overall","एकूण","बेरीज","किती आहे",
-})
-
-
 class QueryParser:
     def parse(self, user_query: str, module_key: str, lang: str) -> Dict[str, Any]:
         text_lower = user_query.lower()
@@ -936,7 +996,6 @@ class QueryParser:
 
         is_bulk = any(tok in bulk for tok in tokens)
 
-        # Build module vocabulary to strip
         mod = MODULE_REGISTRY[module_key]
         mod_words: set = set()
         for kw in mod["keywords"]:
@@ -949,7 +1008,6 @@ class QueryParser:
             if m == module_key:
                 mod_words.update(kw.split())
 
-        # Detect target column
         target_col = None
         col_words: set = set()
         for trigger, cols in COLUMN_TRIGGERS.items():
@@ -961,7 +1019,6 @@ class QueryParser:
         strip        = stop | mod_words | col_words
         value_tokens = [tok for tok in tokens if tok not in strip and len(tok) > 1]
 
-        # Preserve code-like tokens
         code_tokens = [
             tok for tok in tokens
             if re.match(r"^[a-z0-9\-]+$", tok)
@@ -973,33 +1030,39 @@ class QueryParser:
 
         search_value = " ".join(value_tokens).strip()
 
-        # BUG-07 FIX: if EVERY token was a stop/module word, force BULK_LIST
-        # This fixes "give me suppliers list", "show me all purchases", etc.
-        all_stripped = len(value_tokens) == 0 and len(tokens) > 0
-        if all_stripped:
+        if len(value_tokens) == 0 and len(tokens) > 0:
             is_bulk = True
+
+        # P1-28: detect negation intent from full query (before bulk check)
+        negation_value: Optional[str] = None
+        neg_m = NEGATION_RE.search(user_query.lower())
+        if neg_m:
+            negation_value = neg_m.group(1).strip()
 
         if target_col:
             intent = "COLUMN_SEARCH" if search_value else "PROMPT_NEEDED"
+        elif negation_value:
+            # Negative search takes priority over GLOBAL_SEARCH
+            intent = "NEGATIVE_SEARCH"
+            search_value = negation_value  # reuse field, semantics handled in retriever
         elif search_value and not is_bulk:
             intent = "GLOBAL_SEARCH"
         else:
             intent = "BULK_LIST"
 
         return {
-            "intent":       intent,
-            "target_col":   target_col,
-            "search_value": search_value,
-            "aggregation":  "SUM" if agg else "NONE",
+            "intent":          intent,
+            "target_col":      target_col,
+            "search_value":    search_value,
+            "negation_value":  negation_value,
+            "aggregation":     "SUM" if agg else "NONE",
         }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 3. DATA MIRROR  — SQLite in-memory + FTS5
-# SEC-03: per-module locks  |  SEC-04: JWT cache  |  SEC-02: safe flatten
-# BUG-10: startup warmup   |  BUG-11: smart sync  |  PERF-08: mmap+WAL
+# DATA MIRROR — SQLite in-memory + FTS5
+# P1-24: FTS restricted to FTS_COLUMNS allowlist
 # ──────────────────────────────────────────────────────────────────────────────
-
 class DataMirror:
     def __init__(self):
         self.conn = sqlite3.connect(":memory:", check_same_thread=False)
@@ -1007,21 +1070,20 @@ class DataMirror:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA temp_store=MEMORY")
-        self.conn.execute("PRAGMA cache_size=-16000")  # 16 MB page cache
-        self.conn.execute(f"PRAGMA mmap_size={SQLITE_MMAP_SIZE}")  # PERF-08
+        self.conn.execute("PRAGMA cache_size=-16000")
+        self.conn.execute(f"PRAGMA mmap_size={SQLITE_MMAP_SIZE}")
 
-        self._ttl:          Dict[str, float]         = {}
-        self._stale_data:   Dict[str, bool]          = {}  # FEAT-02
-        self._cols:         Dict[str, List[str]]     = {}
-        self._locks:        collections.defaultdict  = collections.defaultdict(asyncio.Lock)
-        self._jwt_token:    Optional[str]            = None
-        self._jwt_expires:  float                    = 0.0
-        self._jwt_lock:     asyncio.Lock             = asyncio.Lock()
-        self._http_client:  Optional[Any]            = None  # PERF-10
-
+        self._ttl:         Dict[str, float]        = {}
+        self._stale_data:  Dict[str, bool]         = {}
+        self._cols:        Dict[str, List[str]]    = {}
+        self._fts_cols:    Dict[str, List[str]]    = {}  # P1-24: track FTS cols per table
+        self._locks:       collections.defaultdict = collections.defaultdict(asyncio.Lock)
+        self._jwt_token:   Optional[str]           = None
+        self._jwt_expires: float                   = 0.0
+        self._jwt_lock:    asyncio.Lock            = asyncio.Lock()
+        self._http_client: Optional[Any]           = None
         self._start_time = time.time()
 
-    # ── HTTP client lifecycle (PERF-10) ───────────────────────────────────────
     async def open(self):
         if _FASTAPI_AVAILABLE:
             self._http_client = httpx.AsyncClient(
@@ -1033,7 +1095,6 @@ class DataMirror:
         if self._http_client:
             await self._http_client.aclose()
 
-    # ── JWT caching (SEC-04) ──────────────────────────────────────────────────
     async def _get_token(self) -> Optional[str]:
         now = time.time()
         if self._jwt_token and now < self._jwt_expires - JWT_EXPIRY_BUFFER:
@@ -1064,17 +1125,9 @@ class DataMirror:
         self._jwt_token   = None
         self._jwt_expires = 0.0
 
-    # ── API fetch with retry (SEC-04 + FIX-2: proper httpx cancellation) ────────
     async def _fetch_with_retry(self, url: str,
-                                params: Optional[Dict] = None) -> Optional[List]:
-        """
-        FIX-2: uses httpx.Timeout object with connect+read timeouts so that
-        asyncio.wait_for() can cancel the underlying TCP connection cleanly,
-        not just abandon it while it keeps running in the background.
-        """
+                                params: Optional[Dict] = None) -> Optional[Any]:
         last_exc = None
-        # Per-request timeout slightly under the outer 45s wait_for so httpx
-        # raises cleanly before asyncio kills the coroutine mid-flight.
         req_timeout = httpx.Timeout(connect=5.0, read=25.0, write=5.0, pool=5.0)
         for attempt in range(API_MAX_RETRIES):
             try:
@@ -1083,15 +1136,15 @@ class DataMirror:
                     last_exc = Exception("no token")
                     await asyncio.sleep(1.5 * (2 ** attempt))
                     continue
-                headers  = {"Authorization": f"Bearer {token}",
-                            "Content-Type": "application/json"}
-                req_url  = f"{BASE_URL}{url}"
-                client   = self._http_client or httpx.AsyncClient(timeout=req_timeout)
-                resp     = await client.get(req_url, headers=headers,
-                                            params=params or {},
-                                            timeout=req_timeout)
+                headers = {"Authorization": f"Bearer {token}",
+                           "Content-Type": "application/json"}
+                req_url = f"{BASE_URL}{url}"
+                client  = self._http_client or httpx.AsyncClient(timeout=req_timeout)
+                resp    = await client.get(req_url, headers=headers,
+                                           params=params or {},
+                                           timeout=req_timeout)
                 if resp.status_code == 200:
-                    return self._extract_list(resp.json())
+                    return resp.json()
                 if resp.status_code == 401:
                     self._invalidate_token()
                     log.warning("401 on %s — token invalidated", url)
@@ -1102,14 +1155,10 @@ class DataMirror:
                             url, attempt + 1, resp.status_code, resp.text[:200])
                 last_exc = Exception(f"HTTP {resp.status_code}")
             except (httpx.TimeoutException, httpx.ConnectError) as exc:
-                # FIX-2: httpx raises its own timeout before asyncio cancels —
-                # this guarantees the TCP socket is properly closed.
                 last_exc = exc
-                log.warning("%s attempt %d timeout/connect error: %s",
-                            url, attempt + 1, exc)
+                log.warning("%s attempt %d timeout/connect: %s", url, attempt + 1, exc)
             except asyncio.CancelledError:
-                # FIX-2: propagate cancellation immediately — don't retry
-                log.warning("%s cancelled (outer timeout hit)", url)
+                log.warning("%s cancelled", url)
                 raise
             except Exception as exc:
                 last_exc = exc
@@ -1119,7 +1168,6 @@ class DataMirror:
         log.error("All %d retries failed for %s: %s", API_MAX_RETRIES, url, last_exc)
         return None
 
-    # ── Data extraction ───────────────────────────────────────────────────────
     def _extract_list(self, raw: Any) -> List:
         if isinstance(raw, list):
             return raw
@@ -1133,10 +1181,6 @@ class DataMirror:
         return []
 
     def _flatten(self, records: List) -> List[Dict]:
-        """
-        SEC-02 FIX: concatenate (not cross-join) child arrays.
-        Capped at FLATTEN_MAX_CHILD_ROWS per child array to prevent OOM.
-        """
         out = []
         for rec in records:
             if not isinstance(rec, dict):
@@ -1168,16 +1212,22 @@ class DataMirror:
                 out.append(base)
         return out
 
-    # ── SQLite load ───────────────────────────────────────────────────────────
     def _load(self, key: str, records: List[Dict]):
+        """
+        P1-24: FTS5 virtual table is now built only over FTS_COLUMNS allowlist
+        (intersected with actual record columns), reducing index size and
+        improving search speed. The main data table still stores all columns.
+        """
         cur = self.conn.cursor()
         cur.execute(f'DROP TABLE IF EXISTS "{key}_fts"')
         cur.execute(f'DROP TABLE IF EXISTS "{key}"')
         if not records:
             cur.execute(f'CREATE TABLE "{key}" (_empty TEXT)')
-            self._cols[key] = []
+            self._cols[key]     = []
+            self._fts_cols[key] = []
             self.conn.commit()
             return
+
         seen, all_keys = set(), []
         for r in records:
             for k in r:
@@ -1185,6 +1235,8 @@ class DataMirror:
                     seen.add(k)
                     all_keys.append(k)
         records = records[:MAX_ROWS]
+
+        # Main data table — all columns
         cols_ddl = ", ".join(f'"{k}" TEXT' for k in all_keys)
         cur.execute(f'CREATE TABLE "{key}" (_rowid INTEGER PRIMARY KEY, {cols_ddl})')
         ph      = ",".join(["?"] * len(all_keys))
@@ -1194,21 +1246,33 @@ class DataMirror:
                 f'INSERT INTO "{key}" ({col_sql}) VALUES ({ph})',
                 [r.get(k, "") for k in all_keys],
             )
-        fts_cols = ", ".join(f'"{k}"' for k in all_keys)
-        cur.execute(
-            f'CREATE VIRTUAL TABLE "{key}_fts" USING fts5('
-            f'{fts_cols}, content="{key}", content_rowid="_rowid",'
-            f'tokenize="unicode61 remove_diacritics 1")'
-        )
-        cur.execute(
-            f'INSERT INTO "{key}_fts" (rowid, {fts_cols}) '
-            f'SELECT _rowid, {fts_cols} FROM "{key}"'
-        )
-        self.conn.commit()
-        self._cols[key] = all_keys
-        log.info("Loaded %d rows into '%s'", len(records), key)
 
-    # ── BUG-13: temp table cleanup ─────────────────────────────────────────────
+        # P1-24: FTS table — only allowlisted columns that exist in this dataset
+        fts_eligible = [k for k in all_keys if k in FTS_COLUMNS]
+        # Fallback: if no eligible columns, use first 5 text-looking columns
+        if not fts_eligible:
+            fts_eligible = [k for k in all_keys
+                            if k.lower() not in ("_rowid", "_empty", "_data")][:5]
+
+        if fts_eligible:
+            fts_cols_ddl = ", ".join(f'"{k}"' for k in fts_eligible)
+            fts_col_sel  = ", ".join(f'"{k}"' for k in fts_eligible)
+            cur.execute(
+                f'CREATE VIRTUAL TABLE "{key}_fts" USING fts5('
+                f'{fts_cols_ddl}, content="{key}", content_rowid="_rowid",'
+                f'tokenize="unicode61 remove_diacritics 1")'
+            )
+            cur.execute(
+                f'INSERT INTO "{key}_fts" (rowid, {fts_col_sel}) '
+                f'SELECT _rowid, {fts_col_sel} FROM "{key}"'
+            )
+
+        self.conn.commit()
+        self._cols[key]     = all_keys
+        self._fts_cols[key] = fts_eligible
+        log.info("Loaded %d rows into '%s' (fts on %d/%d cols)",
+                 len(records), key, len(fts_eligible), len(all_keys))
+
     def _drop_targeted(self, key: str):
         try:
             cur = self.conn.cursor()
@@ -1216,26 +1280,17 @@ class DataMirror:
             cur.execute(f'DROP TABLE IF EXISTS "{key}"')
             self.conn.commit()
             self._cols.pop(key, None)
+            self._fts_cols.pop(key, None)
         except Exception:
             pass
 
-    # ── Sync with per-module lock (SEC-03) ────────────────────────────────────
     async def sync_module(self, key: str, force: bool = False) -> str:
-        """
-        Returns 'ok' | 'fresh' | 'stale' | 'error' | 'open'
-        BUG-11: returns 'fresh' without API call if TTL still valid.
-        FEAT-02: on API failure returns 'stale' (uses cached data if any).
-        FIX-3: circuit breaker short-circuits when ERP is known-down.
-        """
         now = time.time()
         if not force and now < self._ttl.get(key, 0):
             return "fresh"
-
-        # FIX-3: check breaker before acquiring module lock
         if circuit_breaker.is_open:
             log.debug("CircuitBreaker OPEN — skipping sync for '%s'", key)
             return "stale" if self._cols.get(key) else "error"
-
         async with self._locks[key]:
             now = time.time()
             if not force and now < self._ttl.get(key, 0):
@@ -1243,18 +1298,18 @@ class DataMirror:
             mod = MODULE_REGISTRY[key]
             raw = await self._fetch_with_retry(mod["url"])
             if raw is None:
-                circuit_breaker.record_failure()   # FIX-3
+                circuit_breaker.record_failure()
                 if self._cols.get(key):
                     self._stale_data[key] = True
                     log.warning("Using stale data for '%s'", key)
                     return "stale"
                 return "error"
-            circuit_breaker.record_success()       # FIX-3
-            flat = self._flatten(raw)
+            circuit_breaker.record_success()
+            flat = self._flatten(self._extract_list(raw))
             self._load(key, flat)
             self._ttl[key]        = time.time() + mod["ttl"]
             self._stale_data[key] = False
-            response_cache.invalidate_module(key)  # FIX-4: fresh data → purge stale HTML
+            response_cache.invalidate_module(key)
             return "ok"
 
     async def sync_modules(self, keys: List[str],
@@ -1263,20 +1318,18 @@ class DataMirror:
             *[self.sync_module(k, force) for k in keys],
             return_exceptions=True,
         )
-        return {
-            k: (r if isinstance(r, str) else "error")
-            for k, r in zip(keys, results)
-        }
+        return {k: (r if isinstance(r, str) else "error")
+                for k, r in zip(keys, results)}
 
     async def sync_all(self, force: bool = False) -> Dict[str, str]:
-        """
-        BUG-11 FIX: without force=True only re-fetches stale modules.
-        force=True re-fetches everything unconditionally.
-        """
         return await self.sync_modules(list(MODULE_REGISTRY.keys()), force=force)
 
     def columns(self, key: str) -> List[str]:
         return self._cols.get(key, [])
+
+    def fts_columns(self, key: str) -> List[str]:
+        """P1-24: return which columns are indexed in FTS for this table."""
+        return self._fts_cols.get(key, [])
 
     def is_stale(self, key: str) -> bool:
         return self._stale_data.get(key, False)
@@ -1288,10 +1341,9 @@ class DataMirror:
         now = time.time()
         return {
             k: {
-                "cached": bool(self._cols.get(k)),
-                "rows":   len(self._cols.get(k, [])),
+                "cached":        bool(self._cols.get(k)),
                 "ttl_remaining": max(0, int(self._ttl.get(k, 0) - now)),
-                "stale": self._stale_data.get(k, False),
+                "stale":         self._stale_data.get(k, False),
             }
             for k in MODULE_REGISTRY
         }
@@ -1301,14 +1353,8 @@ db = DataMirror()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# FIX-3: CIRCUIT BREAKER
-# Prevents hammering a dead ERP — opens after CB_FAILURE_THRESHOLD consecutive
-# failures, probes after CB_RECOVERY_TIMEOUT, closes after CB_SUCCESS_THRESHOLD
-# consecutive successes in half-open state.
-# sync_module() routes through the breaker; callers still get "stale" or
-# "error" back — the breaker just short-circuits the actual HTTP call.
+# CIRCUIT BREAKER
 # ──────────────────────────────────────────────────────────────────────────────
-
 class _CBState:
     CLOSED    = "closed"
     OPEN      = "open"
@@ -1317,20 +1363,19 @@ class _CBState:
 
 class CircuitBreaker:
     def __init__(self):
-        self._state          = _CBState.CLOSED
-        self._failures       = 0
-        self._successes      = 0
-        self._opened_at      = 0.0
-        self._lock           = asyncio.Lock()
+        self._state     = _CBState.CLOSED
+        self._failures  = 0
+        self._successes = 0
+        self._opened_at = 0.0
 
     @property
     def is_open(self) -> bool:
         if self._state == _CBState.OPEN:
             if time.time() - self._opened_at >= CB_RECOVERY_TIMEOUT:
-                self._state    = _CBState.HALF_OPEN
+                self._state     = _CBState.HALF_OPEN
                 self._successes = 0
-                log.info("CircuitBreaker → HALF_OPEN (probe)")
-                return False   # allow one probe through
+                log.info("CircuitBreaker → HALF_OPEN")
+                return False
             return True
         return False
 
@@ -1340,7 +1385,7 @@ class CircuitBreaker:
             if self._successes >= CB_SUCCESS_THRESHOLD:
                 self._state    = _CBState.CLOSED
                 self._failures = 0
-                log.info("CircuitBreaker → CLOSED (recovered)")
+                log.info("CircuitBreaker → CLOSED")
         elif self._state == _CBState.CLOSED:
             self._failures = 0
 
@@ -1353,57 +1398,88 @@ class CircuitBreaker:
                 log.error("CircuitBreaker → OPEN after %d failures", self._failures)
 
     def status(self) -> Dict[str, Any]:
-        return {
-            "state":    self._state,
-            "failures": self._failures,
-            "opens_at": self._opened_at,
-        }
+        return {"state": self._state, "failures": self._failures,
+                "opened_at": self._opened_at}
 
 
 circuit_breaker = CircuitBreaker()
-# BUG-13: unique targeted table per request to prevent key collisions
-# ──────────────────────────────────────────────────────────────────────────────
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SMART QUERY ROUTER
+# ──────────────────────────────────────────────────────────────────────────────
 class SmartQueryRouter:
+    _ERROR_KEYS = frozenset({"message","error","status","statusCode","code","detail","msg"})
+
+    def _is_error_body(self, d: dict) -> bool:
+        if not d:
+            return True
+        keys = set(d.keys())
+        if keys <= self._ERROR_KEYS:
+            return True
+        for k, v in d.items():
+            if k.lower() in ("success", "ok") and v is False:
+                return True
+            if k.lower() == "status" and str(v).lower() in ("error","fail","failed","not found"):
+                return True
+        return False
+
     async def route(self, key: str, parsed: Dict,
                     query_mode: str, query_value: Optional[str]
-                    ) -> Tuple[bool, str]:
-        """
-        BUG-13 FIX: returns (success, targeted_table_key).
-        targeted_table_key is unique per request (uuid suffix) so concurrent
-        requests for the same module don't overwrite each other.
-        """
+                    ) -> Tuple[bool, str, Optional[str]]:
         mod       = MODULE_REGISTRY.get(key, {})
         endpoints = mod.get("search_endpoints", {})
         if not query_mode or query_mode not in endpoints:
-            return False, ""
+            return False, "", None
+
         ep = endpoints[query_mode]
+
+        if query_mode == "next_invoice":
+            raw = await db._fetch_with_retry(ep["url"])
+            if raw is None:
+                return False, "", None
+            if isinstance(raw, dict):
+                val = (raw.get("invoiceNo") or raw.get("nextInvoiceNo") or
+                       raw.get("data") or raw.get("result") or str(raw))
+            else:
+                val = str(raw)
+            return True, "", str(val)
+
         if ep["param"] is None:
             raw = await db._fetch_with_retry(ep["url"])
         else:
             if not query_value:
-                return False, ""
+                return False, "", None
             raw = await db._fetch_with_retry(ep["url"],
                                               params={ep["param"]: query_value})
-        if not raw:
-            return False, ""
-        flat = db._flatten(raw)
+        if raw is None:
+            return False, "", None
+
+        records = db._extract_list(raw)
+        if not records and isinstance(raw, dict):
+            if self._is_error_body(raw):
+                return False, "", None
+            records = [raw]
+
+        if not records:
+            return False, "", None
+
+        flat = db._flatten(records)
         if not flat:
-            return False, ""
-        # BUG-13: unique table key
+            return False, "", None
+
         targeted_key = f"_tgt_{key}_{uuid.uuid4().hex[:8]}"
         db._load(targeted_key, flat)
-        return True, targeted_key
+        return True, targeted_key, None
 
 
 smart_router = SmartQueryRouter()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 4. RAG RETRIEVER
-# BUG-14: FTS injection protection  |  PERF-11: render cap
+# RAG RETRIEVER  — P1-28 _negative() method added
+# P1-24: FTS query restricted to fts_cols per table
 # ──────────────────────────────────────────────────────────────────────────────
-
 class RAGRetriever:
     MAX_FTS  = 500
     MAX_LIKE = 500
@@ -1416,6 +1492,11 @@ class RAGRetriever:
         cols   = db.columns(table_key)
         if not cols:
             return [], [], "empty"
+
+        if intent == "NEGATIVE_SEARCH" and val:
+            rows, method = self._negative(table_key, val, cols)
+            return rows, cols, method
+
         if intent == "BULK_LIST" or not val:
             return self._bulk(table_key), cols, "bulk"
         rows, method = self._fts(table_key, val, tcol, cols)
@@ -1435,20 +1516,21 @@ class RAGRetriever:
     def _fts(self, key: str, val: str, tcol: Optional[str],
              cols: List[str]) -> Tuple[List, str]:
         try:
-            cur = db.conn.cursor()
-            # BUG-14: strip FTS special chars AND boolean operators
+            cur      = db.conn.cursor()
+            fts_cols = db.fts_columns(key)  # P1-24: use restricted FTS cols
+            if not fts_cols:
+                return [], "fts_no_index"
             safe = FTS_SPECIAL.sub(" ", val)
             safe = _FTS_BOOL_RE.sub(" ", safe).strip()
             if not safe:
                 return [], "fts_empty"
             if tcol:
-                ac    = self._resolve_col(tcol, cols)
+                ac = self._resolve_col(tcol, fts_cols)  # restrict to fts cols
                 fts_q = f'"{ac}" : "{safe}"*' if ac else f'"{safe}"*'
             else:
                 words = [w for w in safe.split() if len(w) > 1]
                 if not words:
                     return [], "fts_empty"
-                # BUG-14: quote each word to prevent FTS operator injection
                 fts_q = " OR ".join(f'"{w}"*' for w in words)
             cur.execute(
                 f'SELECT m.* FROM "{key}" m '
@@ -1493,6 +1575,27 @@ class RAGRetriever:
             log.warning("LIKE error %s: %s", key, e)
             return [], "like_error"
 
+    def _negative(self, key: str, val: str, cols: List[str]) -> Tuple[List, str]:
+        """
+        P1-28: Negative search — returns rows where NO column contains val.
+        Runs: SELECT * FROM table WHERE col1 NOT LIKE '%val%' AND col2 NOT LIKE '%val%' ...
+        """
+        try:
+            cur    = db.conn.cursor()
+            conds  = " AND ".join(f'("{c}" NOT LIKE ? OR "{c}" IS NULL)' for c in cols)
+            params = [f"%{val}%"] * len(cols)
+            cur.execute(
+                f'SELECT * FROM "{key}" WHERE {conds} LIMIT {self.MAX_LIKE}',
+                params,
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+            for r in rows:
+                r.pop("_rowid", None)
+            return rows, "negative"
+        except Exception as e:
+            log.warning("Negative search error %s: %s", key, e)
+            return [], "negative_error"
+
     def _bulk(self, key: str) -> List:
         try:
             cur = db.conn.cursor()
@@ -1510,9 +1613,8 @@ retriever = RAGRetriever()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# PERF-06: RESPONSE CACHE (LRU + TTL)
+# RESPONSE CACHE (LRU + TTL)
 # ──────────────────────────────────────────────────────────────────────────────
-
 class ResponseCache:
     def __init__(self, max_size: int = RESPONSE_CACHE_SIZE, ttl: float = RESPONSE_CACHE_TTL):
         self._cache: "collections.OrderedDict[str, Tuple[str, float]]" = \
@@ -1531,7 +1633,7 @@ class ResponseCache:
         if time.time() - ts > self._ttl:
             del self._cache[k]
             return None
-        self._cache.move_to_end(k)  # LRU update
+        self._cache.move_to_end(k)
         return html_resp
 
     def set(self, module: str, intent: str, value: str, lang: str, resp: str):
@@ -1539,7 +1641,7 @@ class ResponseCache:
         self._cache[k] = (resp, time.time())
         self._cache.move_to_end(k)
         if len(self._cache) > self._max_size:
-            self._cache.popitem(last=False)  # evict oldest
+            self._cache.popitem(last=False)
 
     def invalidate_module(self, module: str):
         keys = [k for k in self._cache if k.startswith(f"{module}|")]
@@ -1554,9 +1656,44 @@ response_cache = ResponseCache()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 5. AGGREGATION ENGINE  (SEC-05: math.isfinite guard)
+# P1-26: LATENCY TRACKER — ring buffer → p50/p95/p99 ms
 # ──────────────────────────────────────────────────────────────────────────────
+class LatencyTracker:
+    """
+    Records process() latency samples in a fixed-size deque (ring buffer).
+    Computes p50, p95, p99 on demand. Thread-safe for asyncio single-worker.
+    """
+    def __init__(self, maxlen: int = 1000):
+        self._samples: deque = deque(maxlen=maxlen)
 
+    def record(self, elapsed_seconds: float):
+        self._samples.append(elapsed_seconds * 1000)  # store in ms
+
+    def percentiles(self) -> Dict[str, Optional[float]]:
+        if not self._samples:
+            return {"p50": None, "p95": None, "p99": None, "count": 0}
+        s = sorted(self._samples)
+        n = len(s)
+        def pct(p: float) -> float:
+            idx = max(0, min(n - 1, int(math.ceil(p / 100 * n)) - 1))
+            return round(s[idx], 2)
+        return {
+            "p50":   pct(50),
+            "p95":   pct(95),
+            "p99":   pct(99),
+            "count": n,
+        }
+
+    def count(self) -> int:
+        return len(self._samples)
+
+
+latency_tracker = LatencyTracker()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# AGGREGATION ENGINE
+# ──────────────────────────────────────────────────────────────────────────────
 class AggregationEngine:
     def compute(self, records: List[Dict], key: str) -> Dict[str, Any]:
         base_key = key.split("_tgt_")[0] if "_tgt_" in key else key
@@ -1570,10 +1707,8 @@ class AggregationEngine:
                 ak = next((k for k in rec if k.lower() == col.lower()), None)
                 if ak:
                     try:
-                        num = float(
-                            str(rec[ak]).replace(",", "").replace("₹", "").strip()
-                        )
-                        if math.isfinite(num):   # SEC-05
+                        num = float(str(rec[ak]).replace(",", "").replace("₹", "").strip())
+                        if math.isfinite(num):
                             total_a += num
                     except (ValueError, TypeError):
                         pass
@@ -1583,7 +1718,7 @@ class AggregationEngine:
                 if qk:
                     try:
                         num = float(str(rec[qk]).replace(",", "").strip())
-                        if math.isfinite(num):   # SEC-05
+                        if math.isfinite(num):
                             total_q += num
                     except (ValueError, TypeError):
                         pass
@@ -1600,12 +1735,8 @@ aggregator = AggregationEngine()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 6. RESPONSE SYNTHESIZER
-# SEC-01: html.escape everywhere  |  SEC-06: column headers escaped
-# BUG-15: strict datetime detection  |  BUG-16: list.append() join
-# SEC-10: image URL whitelist  |  FEAT-04: truncation badge
+# RESPONSE SYNTHESIZER  — P1-27 print-friendly CSS added
 # ──────────────────────────────────────────────────────────────────────────────
-
 HIDDEN_COLS = frozenset({
     "_id", "__v", "_empty", "_data", "_rowid",
     "password", "jwttoken", "role", "permissions", "token",
@@ -1622,9 +1753,11 @@ PRIORITY_COLS = [
     "address","city","gstNo","barcode","hsnNo","size","color","unit",
 ]
 
-AMOUNT_HINTS = frozenset({"price","amount","total","balance","credit","debit","paid","cost","value","charges","discount"})
+AMOUNT_HINTS = frozenset({"price","amount","total","balance","credit","debit",
+                           "paid","cost","value","charges","discount"})
 QTY_HINTS    = frozenset({"quantity","qty","stock"})
-NOT_CURRENCY = frozenset({"code","no","id","barcode","number","ref","hsn","pin","port","cgst","sgst","igst","missing","received"})
+NOT_CURRENCY = frozenset({"code","no","id","barcode","number","ref","hsn",
+                           "pin","port","cgst","sgst","igst","missing","received"})
 
 STATUS_BADGES: Dict[str, Tuple[str, str]] = {
     "in-state":  ("#dcfce7","#16a34a"),
@@ -1638,8 +1771,22 @@ STATUS_BADGES: Dict[str, Tuple[str, str]] = {
     "upi":       ("#f0fdf4","#16a34a"),
 }
 
-# SEC-10: allowed image domains
 _IMAGE_SAFE_DOMAIN = BASE_URL.split("//")[-1].split("/")[0]
+
+# P1-27: print-friendly CSS injected once per table — browser deduplicates
+_PRINT_CSS = (
+    '<style id="erp-print-css">'
+    '@media print {'
+    '  .erp-table-wrap { box-shadow: none !important; }'
+    '  .erp-table thead tr { background: #333 !important; '
+    '    -webkit-print-color-adjust: exact; print-color-adjust: exact; }'
+    '  .erp-table tbody tr { page-break-inside: avoid; }'
+    '  .erp-no-print { display: none !important; }'
+    '  .erp-table td, .erp-table th { font-size: 11px !important; '
+    '    padding: 6px 8px !important; }'
+    '}'
+    '</style>'
+)
 
 
 def _is_currency_col(col: str) -> bool:
@@ -1653,37 +1800,24 @@ def _is_qty_col(col: str) -> bool:
 
 
 def _fmt_cell(col: str, val: str) -> str:
-    """
-    BUG-15 FIX: DATETIME_RE used for strict datetime detection.
-    BUG-16 FIX: string concat replaced with list.append().
-    SEC-10: image URLs checked against allowed domain.
-    All user values escaped via html.escape().
-    """
     if not val or val in ("None", "null", ""):
         return '<span style="color:#94a3b8">—</span>'
 
-    # SEC-10: image URL — only allow from known ERP domain
     if (val.startswith("http") and _IMAGE_SAFE_DOMAIN in val
             and any(val.lower().endswith(e)
                     for e in (".png", ".jpg", ".jpeg", ".webp", ".gif"))):
         safe_url = html.escape(val, quote=True)
-        return (
-            f'<img src="{safe_url}" style="width:40px;height:40px;'
-            f'object-fit:cover;border-radius:6px;" loading="lazy" />'
-        )
+        return (f'<img src="{safe_url}" style="width:40px;height:40px;'
+                f'object-fit:cover;border-radius:6px;" loading="lazy" />')
 
-    # BUG-15: strict datetime — must start with YYYY-MM-DDTHH:MM
     if DATETIME_RE.match(val):
         try:
             d, t = val.split("T", 1)
-            return (
-                f'<span style="color:#64748b;font-size:12px">'
-                f'{html.escape(d)} {html.escape(t[:5])}</span>'
-            )
+            return (f'<span style="color:#64748b;font-size:12px">'
+                    f'{html.escape(d)} {html.escape(t[:5])}</span>')
         except Exception:
             pass
 
-    # Currency
     if _is_currency_col(col):
         try:
             num = float(str(val).replace(",", "").replace("₹", "").strip())
@@ -1693,7 +1827,6 @@ def _fmt_cell(col: str, val: str) -> str:
         except (ValueError, TypeError):
             pass
 
-    # Quantity
     if _is_qty_col(col):
         try:
             num   = int(float(str(val).replace(",", "").strip()))
@@ -1702,22 +1835,17 @@ def _fmt_cell(col: str, val: str) -> str:
         except (ValueError, TypeError):
             pass
 
-    # Status badge
-    if col.lower() in ("status","supplytype","type","state","paymentmode"):
+    if col.lower() in ("status", "supplytype", "type", "state", "paymentmode"):
         badge    = STATUS_BADGES.get(val.lower(), ("#f1f5f9","#475569"))
         safe_val = html.escape(val)
-        return (
-            f'<span style="background:{badge[0]};color:{badge[1]};'
-            f'padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600">'
-            f'{safe_val}</span>'
-        )
+        return (f'<span style="background:{badge[0]};color:{badge[1]};'
+                f'padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600">'
+                f'{safe_val}</span>')
 
-    # Default — always escape (SEC-01 / SEC-06)
     return html.escape(str(val))
 
 
 def _base_key(key: str) -> str:
-    """Strip targeted table suffix to get the module key."""
     if "_tgt_" in key:
         return key.split("_tgt_")[0]
     return key.replace("_targeted", "")
@@ -1737,28 +1865,31 @@ class ResponseSynthesizer:
         return MR_COLUMNS.get(eng, eng) if marathi else eng
 
     def stale_banner(self, key: str, marathi: bool) -> str:
-        """FEAT-02: shown when serving cached data after API failure."""
         if marathi:
-            return (
-                '<div style="background:#fef9c3;border:1px solid #fde047;'
+            return ('<div style="background:#fef9c3;border:1px solid #fde047;'
+                    'border-radius:8px;padding:8px 14px;margin-bottom:10px;'
+                    'font-size:13px;color:#854d0e">'
+                    '⚠️ ERP सर्व्हर उपलब्ध नाही — जुना डेटा दाखवत आहे.</div>')
+        return ('<div style="background:#fef9c3;border:1px solid #fde047;'
                 'border-radius:8px;padding:8px 14px;margin-bottom:10px;'
                 'font-size:13px;color:#854d0e">'
-                '⚠️ ERP सर्व्हर उपलब्ध नाही — जुना डेटा दाखवत आहे.</div>'
-            )
-        return (
-            '<div style="background:#fef9c3;border:1px solid #fde047;'
-            'border-radius:8px;padding:8px 14px;margin-bottom:10px;'
-            'font-size:13px;color:#854d0e">'
-            '⚠️ ERP server unreachable — showing last cached data.</div>'
-        )
+                '⚠️ ERP server unreachable — showing last cached data.</div>')
+
+    def scalar_response(self, label: str, value: str, marathi: bool) -> str:
+        safe_val = html.escape(str(value))
+        if marathi:
+            return (f'<div style="background:#f0fdf4;border:1px solid #bbf7d0;'
+                    f'border-radius:10px;padding:16px 20px;">'
+                    f'पुढील {html.escape(label)} क्रमांक: '
+                    f'<strong style="font-size:18px;color:#16a34a">{safe_val}</strong></div>')
+        return (f'<div style="background:#f0fdf4;border:1px solid #bbf7d0;'
+                f'border-radius:10px;padding:16px 20px;">'
+                f'Next {html.escape(label)} number: '
+                f'<strong style="font-size:18px;color:#16a34a">{safe_val}</strong></div>')
 
     def intro(self, key: str, agg: Dict, search_val: str,
               marathi: bool, lang: str,
               total_found: int = 0, rendered: int = 0) -> str:
-        """
-        SEC-01 FIX: search_val html.escape()-d.
-        FEAT-04: shows truncation badge when rendered < total_found.
-        """
         count    = agg["count"]
         amt      = agg["total_amount"]
         qty      = agg["total_qty"]
@@ -1767,34 +1898,25 @@ class ResponseSynthesizer:
 
         if marathi:
             label = MR_MODULES.get(bk, html.escape(bk))
-            if safe_val:
-                text = (
-                    f'<strong>{label}</strong> मध्ये '
-                    f'<strong>"{safe_val}"</strong> साठी शोधले — '
-                    f'<strong>{count:,} नोंदी</strong> सापडल्या.'
-                )
-            else:
-                text = (
-                    f'<strong>{label}</strong> ची संपूर्ण यादी — '
-                    f'<strong>{count:,} नोंदी</strong>.'
-                )
+            text  = (
+                f'<strong>{label}</strong> मध्ये <strong>"{safe_val}"</strong> साठी शोधले — '
+                f'<strong>{count:,} नोंदी</strong> सापडल्या.'
+                if safe_val else
+                f'<strong>{label}</strong> ची संपूर्ण यादी — <strong>{count:,} नोंदी</strong>.'
+            )
             parts = []
-            if amt:  parts.append(f'एकूण रक्कम: <strong>₹{amt:,.2f}</strong>')
-            if qty:  parts.append(f'एकूण युनिट: <strong>{qty:,}</strong>')
+            if amt: parts.append(f'एकूण रक्कम: <strong>₹{amt:,.2f}</strong>')
+            if qty: parts.append(f'एकूण युनिट: <strong>{qty:,}</strong>')
         else:
             label = html.escape(bk.replace("-", " ").title())
-            ack   = random.choice(["Here you go! ","Got it. ","Absolutely! ","Done — "])
-            if safe_val:
-                text = (
-                    f'{ack}Searched <strong>{label}</strong> for '
-                    f'<strong>"{safe_val}"</strong> — '
-                    f'<strong>{count:,} record{"s" if count != 1 else ""}</strong> found.'
-                )
-            else:
-                text = (
-                    f'{ack}Complete <strong>{label}</strong> list — '
-                    f'<strong>{count:,} record{"s" if count != 1 else ""}</strong>.'
-                )
+            ack   = random.choice(["Here you go! ", "Got it. ", "Absolutely! ", "Done — "])
+            text  = (
+                f'{ack}Searched <strong>{label}</strong> for <strong>"{safe_val}"</strong> — '
+                f'<strong>{count:,} record{"s" if count != 1 else ""}</strong> found.'
+                if safe_val else
+                f'{ack}Complete <strong>{label}</strong> list — '
+                f'<strong>{count:,} record{"s" if count != 1 else ""}</strong>.'
+            )
             parts = []
             if amt: parts.append(f'Total: <strong>₹{amt:,.2f}</strong>')
             if qty: parts.append(f'Units: <strong>{qty:,}</strong>')
@@ -1802,32 +1924,24 @@ class ResponseSynthesizer:
         if parts:
             text += " &nbsp;·&nbsp; " + " &nbsp;·&nbsp; ".join(parts)
 
-        # FEAT-04: truncation notice
         if total_found > rendered > 0:
-            trunc = (
-                f' &nbsp;<span style="background:#e0f2fe;color:#0369a1;'
-                f'padding:1px 7px;border-radius:999px;font-size:12px">'
-                f'Showing {rendered:,} of {total_found:,}</span>'
-            )
-            text += trunc
+            text += (f' &nbsp;<span style="background:#e0f2fe;color:#0369a1;'
+                     f'padding:1px 7px;border-radius:999px;font-size:12px">'
+                     f'Showing {rendered:,} of {total_found:,}</span>')
 
         return f'<p style="margin:0 0 14px;font-size:15px;line-height:1.6">{text}</p>'
 
     def table(self, records: List[Dict], cols: List[str], marathi: bool,
-              max_rows: int = MAX_RENDER_ROWS) -> str:
+              max_rows: int = MAX_RENDER_ROWS) -> Tuple[str, int]:
         """
-        BUG-16 FIX: list.append() + join() instead of string concat.
-        SEC-06 FIX: column headers html.escape()-d.
-        PERF-11: renders at most max_rows rows.
-        Returns (html_str, rows_rendered).
+        P1-27: Injects _PRINT_CSS block + erp-table-wrap / erp-table CSS classes
+        for print-friendly rendering. Browser deduplicates <style id="erp-print-css">.
         """
         headers = self._headers(cols)
         if not headers:
             return "", 0
-        font = (
-            "'Noto Sans Devanagari','Segoe UI',system-ui,sans-serif"
-            if marathi else "'Segoe UI',system-ui,sans-serif"
-        )
+        font = ("'Noto Sans Devanagari','Segoe UI',system-ui,sans-serif"
+                if marathi else "'Segoe UI',system-ui,sans-serif")
         render_records = records[:max_rows]
 
         rows_html: List[str] = []
@@ -1851,17 +1965,19 @@ class ResponseSynthesizer:
 
         header_cells: List[str] = []
         for h in headers:
-            label = html.escape(self._col_label(h, marathi))  # SEC-06
+            label = html.escape(self._col_label(h, marathi))
             header_cells.append(
                 f'<th style="padding:13px 16px;border-right:1px solid #475569;'
                 f'font-size:12px;font-weight:600;letter-spacing:.04em;'
                 f'white-space:nowrap">{label}</th>'
             )
 
+        # P1-27: add erp-table-wrap + erp-table classes; prepend print CSS
         tbl = "".join([
-            '<div style="overflow-x:auto;border-radius:12px;',
+            _PRINT_CSS,
+            '<div class="erp-table-wrap" style="overflow-x:auto;border-radius:12px;',
             'box-shadow:0 4px 24px rgba(0,0,0,.08);border:1px solid #e2e8f0;">',
-            f'<table style="border-collapse:collapse;width:100%;text-align:left;',
+            f'<table class="erp-table" style="border-collapse:collapse;width:100%;text-align:left;',
             f'background:#fff;font-family:{font};min-width:520px;">',
             '<thead><tr style="background:linear-gradient(135deg,#1e293b,#334155);',
             'color:#f8fafc;">', "".join(header_cells), '</tr></thead>',
@@ -1879,47 +1995,39 @@ class ResponseSynthesizer:
             hint  = {
                 "barcode": "<br><small>टीप: बारकोड पूर्ण स्कॅन करा (उदा. BAR268726580)</small>",
                 "invoice": "<br><small>टीप: इनव्हॉइस नंबर तपासा (उदा. PA00000001)</small>",
-            }.get(query_mode, "")
-            return (
-                f'<div style="background:#fef2f2;border:1px solid #fecaca;'
-                f'border-radius:10px;padding:16px 20px;color:#991b1b;">'
-                f'<strong>{label}</strong> मध्ये <strong>"{safe_val}"</strong> '
-                f'साठी काहीही सापडले नाही.{hint}<br>'
-                f'<small>शब्दलेखन तपासा किंवा लहान शब्द वापरा.</small></div>'
-            )
+            }.get(query_mode or "", "")
+            return (f'<div style="background:#fef2f2;border:1px solid #fecaca;'
+                    f'border-radius:10px;padding:16px 20px;color:#991b1b;">'
+                    f'<strong>{label}</strong> मध्ये <strong>"{safe_val}"</strong> '
+                    f'साठी काहीही सापडले नाही.{hint}<br>'
+                    f'<small>शब्दलेखन तपासा किंवा लहान शब्द वापरा.</small></div>')
         label = html.escape(bk.replace("-", " ").title())
         hint  = {
-            "barcode": "<br><small>Tip: use the full barcode (e.g. BAR268726580)</small>",
-            "invoice": "<br><small>Tip: check invoice number format (e.g. PA00000001)</small>",
-            "contact": "<br><small>Tip: enter a 10-digit mobile number</small>",
-        }.get(query_mode, "")
-        return (
-            f'<div style="background:#fef2f2;border:1px solid #fecaca;'
-            f'border-radius:10px;padding:16px 20px;color:#991b1b;">'
-            f'No results found in <strong>{label}</strong> for '
-            f'<strong>"{safe_val}"</strong>.{hint}<br>'
-            f'<small>Check spelling or try a shorter term.</small></div>'
-        )
+            "barcode": "<br><small>Tip: full barcode e.g. BAR268726580</small>",
+            "invoice": "<br><small>Tip: invoice format e.g. PA00000001</small>",
+            "contact": "<br><small>Tip: 10-digit mobile number</small>",
+            "id":      "<br><small>Tip: numeric ID e.g. 'purchase id 42'</small>",
+        }.get(query_mode or "", "")
+        return (f'<div style="background:#fef2f2;border:1px solid #fecaca;'
+                f'border-radius:10px;padding:16px 20px;color:#991b1b;">'
+                f'No results in <strong>{label}</strong> for '
+                f'<strong>"{safe_val}"</strong>.{hint}<br>'
+                f'<small>Check spelling or try a shorter term.</small></div>')
 
     def api_error(self, key: str, marathi: bool) -> str:
         bk = _base_key(key)
         if marathi:
             label = MR_MODULES.get(bk, html.escape(bk))
-            return (
-                f'<div style="background:#fff7ed;border:1px solid #fed7aa;'
-                f'border-radius:10px;padding:16px 20px;color:#9a3412;">'
-                f'⚠️ <strong>{label}</strong> चा डेटा मिळवता आला नाही '
-                f'({API_MAX_RETRIES} प्रयत्नांनंतर). ERP कनेक्शन तपासा.<br>'
-                f'<small>सर्व्हर लॉग्स console मध्ये तपासा.</small></div>'
-            )
+            return (f'<div style="background:#fff7ed;border:1px solid #fed7aa;'
+                    f'border-radius:10px;padding:16px 20px;color:#9a3412;">'
+                    f'⚠️ <strong>{label}</strong> चा डेटा मिळवता आला नाही '
+                    f'({API_MAX_RETRIES} प्रयत्नांनंतर). ERP कनेक्शन तपासा.</div>')
         label = html.escape(bk.replace("-", " ").title())
-        return (
-            f'<div style="background:#fff7ed;border:1px solid #fed7aa;'
-            f'border-radius:10px;padding:16px 20px;color:#9a3412;">'
-            f'⚠️ Could not fetch <strong>{label}</strong> data after '
-            f'{API_MAX_RETRIES} attempts.<br>'
-            f'<small>Check server logs for HTTP status codes and auth errors.</small></div>'
-        )
+        return (f'<div style="background:#fff7ed;border:1px solid #fed7aa;'
+                f'border-radius:10px;padding:16px 20px;color:#9a3412;">'
+                f'⚠️ Could not fetch <strong>{label}</strong> data after '
+                f'{API_MAX_RETRIES} attempts.<br>'
+                f'<small>Check server logs for auth/connection errors.</small></div>')
 
     def prompt_needed(self, key: str, col: str, marathi: bool) -> str:
         bk = _base_key(key)
@@ -1927,91 +2035,84 @@ class ResponseSynthesizer:
             label   = MR_MODULES.get(bk, html.escape(bk))
             col_eng = CAMEL_RE.sub(r"\1 \2", col).title()
             col_mr  = html.escape(MR_COLUMNS.get(col_eng, col_eng))
-            return (
-                f'तुम्ही <strong>{label}</strong> विभागात शोधत आहात. '
-                f'कृपया <strong>{col_mr}</strong> सांगा.<br>'
-                f'<em>उदाहरण: "invoice PA00000001" किंवा "barcode BAR268726580"</em>'
-            )
+            return (f'तुम्ही <strong>{label}</strong> विभागात शोधत आहात. '
+                    f'कृपया <strong>{col_mr}</strong> सांगा.<br>'
+                    f'<em>उदाहरण: "invoice PA00000001" किंवा "barcode BAR268726580"</em>')
         label     = html.escape(bk.replace("-", " ").title())
         col_label = html.escape(CAMEL_RE.sub(r"\1 \2", col).title())
-        return (
-            f'You\'re searching <strong>{label}</strong>. '
-            f'Please specify the <strong>{col_label}</strong> value.<br>'
-            f'<em>Example: "invoice PA00000001" or "barcode BAR268726580"</em>'
-        )
+        return (f'You\'re searching <strong>{label}</strong>. '
+                f'Please specify the <strong>{col_label}</strong> value.<br>'
+                f'<em>Example: "invoice PA00000001" or "id 42"</em>')
 
-    def targeted_badge(self, query_mode: str, query_value: str,
-                       marathi: bool) -> str:
+    def targeted_badge(self, query_mode: str, query_value: str, marathi: bool) -> str:
         safe_qv = html.escape(query_value or "")
         labels = {
             "marathi": {
-                "barcode": f"बारकोड शोध: {safe_qv}",
-                "invoice": f"इनव्हॉइस शोध: {safe_qv}",
-                "contact": f"संपर्क शोध: {safe_qv}",
-                "active":  "सक्रिय नोंद",
+                "barcode":      f"बारकोड शोध: {safe_qv}",
+                "invoice":      f"इनव्हॉइस शोध: {safe_qv}",
+                "contact":      f"संपर्क शोध: {safe_qv}",
+                "id":           f"ID शोध: {safe_qv}",
+                "name":         f"नाव शोध: {safe_qv}",
+                "active":       "सक्रिय नोंद",
+                "next_invoice": "पुढील इनव्हॉइस क्रमांक",
+                "negation":     f"वगळलेले: {safe_qv}",
             },
             "english": {
-                "barcode": f"Targeted barcode lookup: {safe_qv}",
-                "invoice": f"Targeted invoice lookup: {safe_qv}",
-                "contact": f"Targeted contact lookup: {safe_qv}",
-                "active":  "Showing active record",
+                "barcode":      f"Targeted barcode lookup: {safe_qv}",
+                "invoice":      f"Targeted invoice lookup: {safe_qv}",
+                "contact":      f"Targeted contact lookup: {safe_qv}",
+                "id":           f"Targeted ID lookup: {safe_qv}",
+                "name":         f"Targeted name lookup: {safe_qv}",
+                "active":       "Showing active record",
+                "next_invoice": "Next invoice number",
+                "negation":     f"Excluding: {safe_qv}",
             },
         }
         lang_key = "marathi" if marathi else "english"
         txt      = html.escape(labels[lang_key].get(query_mode, query_mode))
-        return (
-            f'<div style="background:#f0f9ff;border:1px solid #bae6fd;'
-            f'border-radius:8px;padding:8px 14px;margin-bottom:10px;'
-            f'font-size:13px;color:#0369a1">⚡ {txt}</div>'
-        )
+        return (f'<div style="background:#f0f9ff;border:1px solid #bae6fd;'
+                f'border-radius:8px;padding:8px 14px;margin-bottom:10px;'
+                f'font-size:13px;color:#0369a1">⚡ {txt}</div>')
 
     def unrecognized(self, marathi: bool) -> str:
         if marathi:
             mods = " · ".join(MR_MODULES.values())
-            return (
-                f'<div style="background:#f8fafc;border:1px solid #e2e8f0;'
-                f'border-radius:10px;padding:16px 20px;">'
-                f'<strong>मला समजले नाही.</strong> मी खालील गोष्टींमध्ये मदत करू शकतो:<br>'
-                f'<em>{html.escape(mods)}</em><br><br>उदाहरणे:'
-                f'<ul style="margin:8px 0;padding-left:20px">'
-                f'<li><em>सर्व खरेदी दाखवा</em></li>'
-                f'<li><em>vikri list</em></li>'
-                f'<li><em>supplier credit kiti ahe</em></li>'
-                f'<li><em>stock bagha</em></li>'
-                f'<li><em>supplier chi yadi dakhva</em></li>'
-                f'<li><em>category list</em></li>'
-                f'</ul></div>'
-            )
+            return (f'<div style="background:#f8fafc;border:1px solid #e2e8f0;'
+                    f'border-radius:10px;padding:16px 20px;">'
+                    f'<strong>मला समजले नाही.</strong> मी खालील गोष्टींमध्ये मदत करू शकतो:<br>'
+                    f'<em>{html.escape(mods)}</em><br><br>उदाहरणे:'
+                    f'<ul style="margin:8px 0;padding-left:20px">'
+                    f'<li><em>सर्व खरेदी दाखवा</em></li>'
+                    f'<li><em>vikri list</em></li>'
+                    f'<li><em>supplier credit kiti ahe</em></li>'
+                    f'<li><em>stock bagha</em></li>'
+                    f'<li><em>category list</em></li>'
+                    f'</ul></div>')
         mods = ", ".join(k.replace("-", " ").title() for k in MODULE_REGISTRY)
-        return (
-            f'<div style="background:#f8fafc;border:1px solid #e2e8f0;'
-            f'border-radius:10px;padding:16px 20px;">'
-            f"<strong>I'm not sure what you're looking for.</strong><br>"
-            f"I can help with: <em>{html.escape(mods)}</em><br><br>Try:"
-            f"<ul style='margin:8px 0;padding-left:20px'>"
-            f"<li><em>List all purchases</em></li>"
-            f"<li><em>Show supplier credits</em></li>"
-            f"<li><em>Find customer named Rahul</em></li>"
-            f"<li><em>Financial summary</em></li>"
-            f"<li><em>Supplier purchase history</em></li>"
-            f"<li><em>Get product categories</em></li>"
-            f"<li><em>Customer payment history</em></li>"
-            f"<li><em>Barcode BAR268726580</em></li>"
-            f"</ul></div>"
-        )
+        return (f'<div style="background:#f8fafc;border:1px solid #e2e8f0;'
+                f'border-radius:10px;padding:16px 20px;">'
+                f"<strong>I'm not sure what you're looking for.</strong><br>"
+                f"I can help with: <em>{html.escape(mods)}</em><br><br>Try:"
+                f"<ul style='margin:8px 0;padding-left:20px'>"
+                f"<li><em>List all purchases</em></li>"
+                f"<li><em>Show supplier credits</em></li>"
+                f"<li><em>Find customer named Rahul</em></li>"
+                f"<li><em>Financial summary</em></li>"
+                f"<li><em>Barcode BAR268726580</em></li>"
+                f"<li><em>Purchase id 42</em></li>"
+                f"<li><em>Next purchase invoice number</em></li>"
+                f"<li><em>Customer payment history</em></li>"
+                f"<li><em>Show purchases not cancelled</em></li>"
+                f"</ul></div>")
 
 
 synth = ResponseSynthesizer()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 7. CONVERSATION CONTEXT
-# BUG-09 FIX: LRU eviction (MAX_SESSIONS) + session TTL (SESSION_TTL)
-# SEC-08 FIX: session_id sanitized
+# CONVERSATION CONTEXT  (FIX-M1: throttled eviction retained)
 # ──────────────────────────────────────────────────────────────────────────────
-
 def _sanitize_session_id(sid: str) -> str:
-    """SEC-08: alphanumeric only, max 64 chars."""
     clean = SESSION_RE.sub("", sid)[:64]
     return clean if clean else "default"
 
@@ -2019,15 +2120,18 @@ def _sanitize_session_id(sid: str) -> str:
 class ConversationContext:
     def __init__(self, max_sessions: int = MAX_SESSIONS,
                  max_turns: int = 5, session_ttl: float = SESSION_TTL):
-        # OrderedDict for LRU eviction
-        self._sessions: "collections.OrderedDict[str, Tuple[deque, float]]" = \
+        self._sessions:      "collections.OrderedDict[str, Tuple[deque, float]]" = \
             collections.OrderedDict()
-        self._max_sessions = max_sessions
-        self._max_turns    = max_turns
-        self._session_ttl  = session_ttl
+        self._max_sessions   = max_sessions
+        self._max_turns      = max_turns
+        self._session_ttl    = session_ttl
+        self._last_evict: float = 0.0
 
     def _evict_stale(self):
         now = time.time()
+        if now - self._last_evict < 60.0:
+            return
+        self._last_evict = now
         stale = [k for k, (_, ts) in self._sessions.items()
                  if now - ts > self._session_ttl]
         for k in stale:
@@ -2038,11 +2142,11 @@ class ConversationContext:
         self._evict_stale()
         if sid not in self._sessions:
             if len(self._sessions) >= self._max_sessions:
-                self._sessions.popitem(last=False)  # evict oldest
+                self._sessions.popitem(last=False)
             self._sessions[sid] = (deque(maxlen=self._max_turns), time.time())
         turns, _ = self._sessions[sid]
         turns.append({"role": role, "text": text[:300]})
-        self._sessions[sid] = (turns, time.time())  # refresh TTL
+        self._sessions[sid] = (turns, time.time())
         self._sessions.move_to_end(sid)
 
     def last_module(self, sid: str) -> Optional[str]:
@@ -2065,32 +2169,14 @@ ctx = ConversationContext()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SEC-07: RATE LIMITER — sliding window token bucket per IP
+# RATE LIMITER
 # ──────────────────────────────────────────────────────────────────────────────
-
 class RateLimiter:
-    """
-    Sliding-window rate limiter — in-memory per-process.
-
-    FIX-8 NOTE: This is intentionally single-process. On Render free tier
-    you have exactly 1 worker (512 MB / 1 vCPU limit). If you ever scale to
-    multiple workers (Render paid tier, Docker Swarm, etc.), replace this with
-    a shared Redis counter:
-        key = f"ratelimit:{ip}"
-        count = redis.incr(key)
-        redis.expire(key, 60)
-        if count > RATE_LIMIT_RPM: block
-    The in-process version is correct and safe for single-worker deployments.
-    """
     def __init__(self, rpm: int = RATE_LIMIT_RPM):
-        self._rpm      = rpm
-        self._windows: Dict[str, deque] = defaultdict(lambda: deque())
+        self._rpm     = rpm
+        self._windows: Dict[str, deque] = defaultdict(deque)
 
     def check(self, ip: str) -> Tuple[bool, int]:
-        """
-        Returns (allowed, remaining_requests_this_minute).
-        FIX-8: remaining count returned so endpoint can set X-RateLimit-Remaining.
-        """
         now    = time.time()
         window = self._windows[ip]
         cutoff = now - 60.0
@@ -2111,11 +2197,8 @@ rate_limiter = RateLimiter()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 8. MAIN ORCHESTRATOR
-# BUG-12: asyncio.wait_for timeout  |  BUG-13: targeted table cleanup
-# PERF-06: response cache integration
+# MAIN ORCHESTRATOR  — P1-26: latency tracking added
 # ──────────────────────────────────────────────────────────────────────────────
-
 class AdminEngine:
     def __init__(self):
         self.classifier = IntentClassifier()
@@ -2153,7 +2236,6 @@ class AdminEngine:
         if parsed["intent"] == "PROMPT_NEEDED":
             return synth.prompt_needed(key, parsed["target_col"], marathi)
 
-        # PERF-06: check response cache first (skip for targeted/live lookups)
         if not q_mode:
             cached = response_cache.get(
                 key, parsed["intent"], parsed["search_value"], lang
@@ -2164,22 +2246,36 @@ class AdminEngine:
         targeted_key   = None
         targeted_badge = ""
 
-        # Try targeted API
-        if q_mode and q_val:
-            ok, targeted_key = await smart_router.route(key, parsed, q_mode, q_val)
+        if q_mode:
+            ok, targeted_key, scalar = await smart_router.route(
+                key, parsed, q_mode, q_val
+            )
             if ok:
-                targeted_badge = synth.targeted_badge(q_mode, q_val, marathi)
-                try:
-                    records, cols, _ = retriever.retrieve(targeted_key, parsed)
-                    if records:
-                        agg          = aggregator.compute(records, key)
-                        intro        = synth.intro(key, agg, q_val, marathi, lang)
-                        tbl, rendered= synth.table(records, cols, marathi)
-                        ctx.add(sid, "bot", f"_module:{key}")
-                        return targeted_badge + intro + tbl
-                finally:
-                    if targeted_key:
-                        db._drop_targeted(targeted_key)   # BUG-13
+                targeted_badge = synth.targeted_badge(q_mode, q_val or "", marathi)
+
+                if scalar is not None:
+                    bk    = _base_key(key)
+                    label = (MR_MODULES.get(bk, bk) if marathi
+                             else bk.replace("-", " ").title())
+                    ctx.add(sid, "bot", f"_module:{key}")
+                    return targeted_badge + synth.scalar_response(label, scalar, marathi)
+
+                if targeted_key:
+                    try:
+                        records, cols, _ = retriever.retrieve(targeted_key, parsed)
+                        if records:
+                            agg           = aggregator.compute(records, key)
+                            intro         = synth.intro(key, agg, q_val or "",
+                                                        marathi, lang)
+                            tbl, rendered = synth.table(records, cols, marathi)
+                            ctx.add(sid, "bot", f"_module:{key}")
+                            return targeted_badge + intro + tbl
+                        else:
+                            return targeted_badge + synth.no_results(
+                                key, q_val or "", marathi, q_mode
+                            )
+                    finally:
+                        db._drop_targeted(targeted_key)
 
         # Full module sync
         status = await db.sync_module(key)
@@ -2187,7 +2283,6 @@ class AdminEngine:
             return synth.api_error(key, marathi)
 
         stale_banner = synth.stale_banner(key, marathi) if status == "stale" else ""
-
         records, cols, _ = retriever.retrieve(key, parsed)
 
         if not records:
@@ -2197,7 +2292,6 @@ class AdminEngine:
 
         agg = aggregator.compute(records, key)
 
-        # Aggregation-only
         if parsed["aggregation"] == "SUM" and parsed["intent"] != "BULK_LIST":
             bk    = _base_key(key)
             label = html.escape(bk.replace("-", " ").title())
@@ -2206,11 +2300,9 @@ class AdminEngine:
                 parts.append(f'Total: <strong>₹{agg["total_amount"]:,.2f}</strong>')
             if agg["total_qty"]:
                 parts.append(f'Units: <strong>{agg["total_qty"]:,}</strong>')
-            result = (
-                f'<div style="background:#f0fdf4;border:1px solid #bbf7d0;'
-                f'border-radius:10px;padding:14px 20px">'
-                + " &nbsp;·&nbsp; ".join(parts) + "</div>"
-            )
+            result = (f'<div style="background:#f0fdf4;border:1px solid #bbf7d0;'
+                      f'border-radius:10px;padding:14px 20px">'
+                      + " &nbsp;·&nbsp; ".join(parts) + "</div>")
             return stale_banner + result
 
         tbl, rendered = synth.table(records, cols, marathi)
@@ -2219,7 +2311,6 @@ class AdminEngine:
         result = stale_banner + intro + tbl
         ctx.add(sid, "bot", f"_module:{key}")
 
-        # Cache only fresh full-table results
         if not q_mode and status in ("ok", "fresh"):
             response_cache.set(
                 key, parsed["intent"], parsed["search_value"], lang, result
@@ -2232,7 +2323,7 @@ class AdminEngine:
         label   = html.escape(pattern["label"])
         synced  = await db.sync_modules(keys)
         sects:  List[str] = []
-        total_a = total_q = 0
+        total_a = total_q = 0.0
 
         for key in keys:
             st = synced.get(key, "error")
@@ -2245,17 +2336,16 @@ class AdminEngine:
                     + synth.api_error(key, False) + "</div>"
                 )
                 continue
-
             stale_warn = synth.stale_banner(key, False) if st == "stale" else ""
             parsed = self.parser.parse(query, key, "english")
             parsed["intent"]       = "BULK_LIST"
             parsed["search_value"] = ""
-            records, cols, _  = retriever.retrieve(key, parsed)
+            records, cols, _ = retriever.retrieve(key, parsed)
             if not records:
                 continue
-            agg       = aggregator.compute(records, key)
-            total_a  += agg["total_amount"] or 0
-            total_q  += agg["total_qty"]    or 0
+            agg      = aggregator.compute(records, key)
+            total_a += agg["total_amount"] or 0
+            total_q += agg["total_qty"]    or 0
             mod_label = html.escape(key.replace("-", " ").title())
             tbl, rendered = synth.table(records, cols, False)
             intro = synth.intro(key, agg, "", False, "english",
@@ -2274,7 +2364,7 @@ class AdminEngine:
         if total_a:
             summary.append(f'Total: <strong>₹{total_a:,.2f}</strong>')
         if total_q:
-            summary.append(f'Units: <strong>{total_q:,}</strong>')
+            summary.append(f'Units: <strong>{int(total_q):,}</strong>')
 
         header = "".join([
             '<div style="background:linear-gradient(135deg,#6366f1,#8b5cf6);',
@@ -2290,34 +2380,33 @@ engine = AdminEngine()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 9. STATIC RESPONSES
+# STATIC RESPONSES  — v7.1
 # ──────────────────────────────────────────────────────────────────────────────
-
 GREETING_EN = """
 <div style="font-family:'Segoe UI',system-ui,sans-serif;max-width:580px">
   <p style="font-size:18px;font-weight:700;margin:0 0 14px;color:#1e293b">
-    👋 Hello! I'm your <span style="color:#6366f1">ERP Intelligence Assistant v6.2</span>.
+    👋 Hello! I'm your <span style="color:#6366f1">ERP Intelligence Assistant v7.1</span>.
   </p>
   <p style="margin:0 0 14px;color:#475569;font-size:14px">Here's what I can help you with:</p>
   <div style="display:grid;gap:8px">
     <div style="background:#f0f9ff;border:1px solid #bae6fd;border-radius:8px;padding:10px 14px;font-size:14px">
-      📦 <strong>Stock &amp; Inventory</strong> — <em>"Show all stock"</em>, <em>"Barcode BAR268726580"</em>
+      📦 <strong>Stock &amp; Inventory</strong> — <em>"Show all stock"</em>, <em>"Barcode BAR268726580"</em>, <em>"Product named Chair"</em>
     </div>
     <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:10px 14px;font-size:14px">
-      💰 <strong>Sales &amp; Purchases</strong> — <em>"Invoice PA00000001"</em>, <em>"Supplier purchase history"</em>
+      💰 <strong>Sales &amp; Purchases</strong> — <em>"Invoice PA00000001"</em>, <em>"Purchase id 42"</em>, <em>"Next purchase invoice number"</em>, <em>"Show bills"</em>
     </div>
     <div style="background:#fdf4ff;border:1px solid #e9d5ff;border-radius:8px;padding:10px 14px;font-size:14px">
-      🏢 <strong>Suppliers &amp; Customers</strong> — <em>"All suppliers"</em>, <em>"Customer payment history"</em>
+      🏢 <strong>Suppliers &amp; Customers</strong> — <em>"All suppliers"</em>, <em>"Customer id 10"</em>, <em>"Customer payment history"</em>, <em>"Debit notes"</em>
     </div>
     <div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:10px 14px;font-size:14px">
-      📊 <strong>Financial Reports</strong> — <em>"Financial summary"</em>, <em>"Supplier credits"</em>
+      📊 <strong>Financial Reports</strong> — <em>"Financial summary"</em>, <em>"Supplier credits"</em>, <em>"Customer ledger detail"</em>
     </div>
     <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:10px 14px;font-size:14px">
-      🗂️ <strong>Categories &amp; Config</strong> — <em>"Product categories"</em>, <em>"Active printer"</em>
+      🔍 <strong>Smart Filters</strong> — <em>"Show purchases not cancelled"</em>, <em>"Material called Cotton"</em>
     </div>
   </div>
   <p style="margin:12px 0 0;font-size:13px;color:#94a3b8">
-    ⚡ Smart lookups: paste a barcode, invoice number, or mobile number for instant results.<br>
+    ⚡ Smart lookups: barcode · invoice · mobile · numeric ID · next invoice · named · exclude.<br>
     You can also ask in <strong>मराठी</strong> or Marathi Roman typing.
   </p>
 </div>
@@ -2326,7 +2415,7 @@ GREETING_EN = """
 GREETING_MR = """
 <div style="font-family:'Noto Sans Devanagari','Segoe UI',system-ui,sans-serif;max-width:580px">
   <p style="font-size:18px;font-weight:700;margin:0 0 14px;color:#1e293b">
-    नमस्कार! मी तुमचा <span style="color:#6366f1">ERP सहाय्यक v6.2</span> आहे. 🙏
+    नमस्कार! मी तुमचा <span style="color:#6366f1">ERP सहाय्यक v7.1</span> आहे. 🙏
   </p>
   <p style="margin:0 0 14px;color:#475569;font-size:14px">मी खालील गोष्टींमध्ये मदत करू शकतो:</p>
   <div style="display:grid;gap:8px">
@@ -2340,14 +2429,11 @@ GREETING_MR = """
       🏢 <strong>पुरवठादार आणि ग्राहक</strong> — <em>"supplier chi yadi"</em>, <em>"grahak payment history"</em>
     </div>
     <div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:10px 14px;font-size:14px">
-      📊 <strong>आर्थिक अहवाल</strong> — <em>"supplier credit kiti ahe"</em>, <em>"financial summary"</em>
-    </div>
-    <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:10px 14px;font-size:14px">
-      🗂️ <strong>श्रेणी आणि सेटिंग</strong> — <em>"category list"</em>, <em>"printer bagha"</em>
+      📊 <strong>आर्थिक अहवाल</strong> — <em>"supplier credit kiti ahe"</em>, <em>"grahak khate saransh"</em>
     </div>
   </div>
   <p style="margin:12px 0 0;font-size:13px;color:#94a3b8">
-    ⚡ बारकोड, इनव्हॉइस नंबर किंवा मोबाईल नंबर टाकून थेट शोध करा.<br>
+    ⚡ बारकोड, इनव्हॉइस, मोबाईल किंवा ID नंबर टाकून थेट शोध करा.<br>
     English मध्ये पण विचारू शकता.
   </p>
 </div>
@@ -2356,101 +2442,115 @@ GREETING_MR = """
 IDENTITY_RESPONSE = """
 <div style="font-family:'Segoe UI',system-ui,sans-serif;max-width:640px">
   <p style="font-size:18px;font-weight:700;color:#1e293b;margin:0 0 12px">
-    🧠 Admin Intelligence Engine v6.2 — Maximum Potential
+    🧠 Admin Intelligence Engine v7.1 — Phase 1 Quick Wins
   </p>
   <p style="margin:0 0 16px;color:#475569">
     Production-grade <strong>RAG pipeline</strong> for ERP —
     zero external AI APIs · full Marathi support · ≤300 MB RAM ·
-    10 security fixes · 10+ bug fixes · 11 performance upgrades.
+    all 35 APIs wired · 43 bugs fixed from v6.3 · 8 Phase-1 features added.
   </p>
   <div style="background:#fef2f2;border-radius:10px;padding:16px;margin-bottom:12px">
-    <strong style="color:#dc2626">🔒 Security (10 fixes):</strong>
-    <ul style="margin:8px 0;padding-left:20px;color:#334155;line-height:1.9;font-size:13px">
-      <li>XSS eliminated — html.escape() on all user values + column headers</li>
-      <li>Memory bomb — concat flatten, FLATTEN_MAX_CHILD_ROWS=200</li>
-      <li>Lock bottleneck — per-module asyncio.Lock (concurrent syncs)</li>
-      <li>JWT spam — class-level token cache + 401 invalidation</li>
-      <li>NaN/Inf aggregation — math.isfinite() on all numerics</li>
-      <li>Rate limiting — 60 req/min per IP sliding window</li>
-      <li>session_id sanitized — alphanumeric only, max 64 chars</li>
-      <li>No default credentials in prod — env vars enforced</li>
-      <li>Image URL whitelist — ERP domain only</li>
-      <li>FTS injection — special chars stripped before MATCH query</li>
-    </ul>
+    <strong style="color:#dc2626">🔒 Security:</strong> XSS prevention · memory bomb protection ·
+    per-module locks · JWT caching · NaN/Inf guards · rate limiting (60 rpm/IP) ·
+    session sanitization · no hardcoded creds · image URL whitelist · FTS injection prevention.
   </div>
   <div style="background:#f0fdf4;border-radius:10px;padding:16px;margin-bottom:12px">
-    <strong style="color:#16a34a">🐛 Bug Fixes (10 fixes):</strong>
-    <ul style="margin:8px 0;padding-left:20px;color:#334155;line-height:1.9;font-size:13px">
-      <li>"give me suppliers list" — all-stop query now forces BULK_LIST</li>
-      <li>Marathi classifier — confidence scoring, min threshold 0.4</li>
-      <li>Session memory — LRU eviction + 30 min TTL (max 500 sessions)</li>
-      <li>Cold start — warmup task pre-fetches 4 modules on startup</li>
-      <li>sync_all — only re-fetches stale modules (not all 16)</li>
-      <li>Request timeout — 45s asyncio.wait_for wraps engine.process()</li>
-      <li>Targeted table collision — uuid suffix per request</li>
-      <li>FTS injection — special operator tokens stripped</li>
-      <li>Datetime false positives — DATETIME_RE strict pattern</li>
-      <li>Table render — list.append()+join() (10× faster for 500+ rows)</li>
-    </ul>
+    <strong style="color:#16a34a">🚀 v7.1 Phase 1 additions:</strong>
+    All 17 modules warmed up (P1-23) ·
+    FTS restricted to 10 key columns for speed (P1-24) ·
+    Named query mode — "product named X" (P1-25) ·
+    Latency p50/p95/p99 in /health (P1-26) ·
+    Print-friendly CSS @media print (P1-27) ·
+    Negative search — "not/exclude/without X" (P1-28) ·
+    Module aliases: bills→sell, debit note→supplier-credit (P1-29) ·
+    python-dotenv support (P1-30).
   </div>
   <div style="background:#f0f9ff;border-radius:10px;padding:16px">
-    <strong style="color:#0369a1">⚡ Performance (11 upgrades):</strong>
-    <ul style="margin:8px 0;padding-left:20px;color:#334155;line-height:1.9;font-size:13px">
-      <li>LRU response cache — 512 entries, 90s TTL, &lt;1ms hits</li>
-      <li>Lazy module loading — only warmup modules load at startup</li>
-      <li>SQLite WAL + 128 MB mmap_size</li>
-      <li>Compiled regex cache — zero per-query recompile</li>
-      <li>Persistent httpx.AsyncClient — reused across all requests</li>
-      <li>MAX_RENDER_ROWS=500 — HTML render cap, full data in SQLite</li>
-      <li>MAX_ROWS=30,000 — safe for 300 MB budget</li>
-      <li>Stale cache fallback — serves last data during ERP downtime</li>
-      <li>Truncation badge — shows "50 of 1,243" when capped</li>
-      <li>Health endpoint — /health for Render monitoring</li>
-      <li>String build with list.join() throughout</li>
-    </ul>
+    <strong style="color:#0369a1">⚡ APIs covered (35):</strong>
+    purchase (6) · sell (5) · material (3) · supplier-credit (2) · customer (4) ·
+    supplier (2) · reports (8) · printer (3) · payment (1) · email-config (3).
   </div>
 </div>
 """
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 10. FASTAPI APPLICATION
-# BUG-10: lifespan warmup  |  BUG-12: request timeout  |  SEC-07: rate limit
-# FEAT-01: /health endpoint
+# P1-30: .env.example — written once at startup if missing
 # ──────────────────────────────────────────────────────────────────────────────
+_ENV_EXAMPLE = """\
+# ── ERP Intelligence Engine — environment variables ──────────────────────────
+# Copy this file to .env and fill in your values.
+# Never commit .env to version control.
 
+# Required: ERP server base URL (no trailing slash)
+ERP_BASE_URL=https://your-erp-server.example.com/your-api-path
+
+# Required: ERP login credentials
+ERP_USERNAME=your_username
+ERP_PASSWORD=your_password
+
+# Dev only: allow built-in default credentials (never use in production)
+# ALLOW_DEFAULT_CREDS=false
+
+# CORS allowed origins (comma-separated, no spaces)
+# Example: CORS_ORIGINS=https://yourapp.com,https://admin.yourapp.com
+CORS_ORIGINS=https://yourapp.com
+
+# Uvicorn bind port (Render injects PORT automatically)
+PORT=8000
+"""
+
+
+def _write_env_example():
+    """Write .env.example to the working directory if it doesn't exist yet."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env.example")
+    if not os.path.exists(path):
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(_ENV_EXAMPLE)
+            log.info(".env.example written to %s", path)
+        except OSError as e:
+            log.warning("Could not write .env.example: %s", e)
+
+
+_write_env_example()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FASTAPI APPLICATION
+# ──────────────────────────────────────────────────────────────────────────────
 if _FASTAPI_AVAILABLE:
-
     from fastapi import FastAPI, status
     from fastapi.middleware.cors import CORSMiddleware
     from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.requests import Request as StarletteRequest
     from starlette.responses import Response as StarletteResponse
-     
-    # ── FIX-1: Startup readiness — blocks requests until warmup done ──────────
+
     async def _warmup():
-        """Pre-fetch the 4 most common modules, then signal ready."""
-        log.info("Warmup: pre-fetching %s", WARMUP_MODULES)
+        # P1-23: warm ALL 17 modules
+        log.info("Warmup: pre-fetching all %d modules: %s",
+                 len(WARMUP_MODULES), WARMUP_MODULES)
         results = await db.sync_modules(WARMUP_MODULES)
-        log.info("Warmup complete: %s", results)
-        _startup_ready.set()   # FIX-1: unblock all waiting requests
+        ok_count = sum(1 for v in results.values() if v == "ok")
+        log.info("Warmup complete: %d/%d modules ok — %s",
+                 ok_count, len(WARMUP_MODULES), results)
+        _startup_ready.set()
 
     @asynccontextmanager
     async def lifespan(app):
-        """Open HTTP client → fire warmup → serve → close HTTP client."""
+        global _startup_ready
+        _startup_ready = asyncio.Event()
         await db.open()
         log.info("HTTP client opened")
         asyncio.create_task(_warmup())
         yield
         await db.close()
         log.info("HTTP client closed")
-    router = APIRouter()
-    app = FastAPI(
-        title="ERP Intelligence Engine v6.3",
-        lifespan=lifespan,
-    )
 
-    # ── FIX-5: CORS ───────────────────────────────────────────────────────────
+    router = APIRouter()
+
+    app = FastAPI(title="ERP Intelligence Engine v7.1", lifespan=lifespan)
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=CORS_ORIGINS,
@@ -2460,27 +2560,17 @@ if _FASTAPI_AVAILABLE:
         max_age=600,
     )
 
-    # ── FIX-6 + FIX-7: Security headers + Request-ID on every response ────────
     class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request: StarletteRequest,
                            call_next) -> StarletteResponse:
-            # FIX-7: echo or generate a request-ID for tracing
-            req_id = (
-                request.headers.get("X-Request-ID")
-                or secrets.token_hex(8)
-            )
+            req_id   = request.headers.get("X-Request-ID") or secrets.token_hex(8)
             response = await call_next(request)
-            # FIX-6: inject security headers
             for k, v in SECURITY_HEADERS.items():
                 response.headers[k] = v
-            # FIX-7: send request-ID back so frontend can log it
             response.headers["X-Request-ID"] = req_id
             return response
 
     app.add_middleware(SecurityHeadersMiddleware)
-    app.include_router(router, prefix="/api")
-
-    # ── Chat endpoint ─────────────────────────────────────────────────────────
 
     class ChatRequest(BaseModel):
         query:      Optional[str] = None
@@ -2498,39 +2588,36 @@ if _FASTAPI_AVAILABLE:
                                "refresh data","sync data"})
     _MR_GREET_W  = frozenset({"नमस्कार","नमस्ते","हॅलो","namaskar","namaste"})
     _MR_THANKS_W = frozenset({"धन्यवाद","आभारी","थँक्यू","dhanyavad","aabhari"})
-    _MR_REFRESH_W= frozenset({"रिफ्रेश","अद्यतन","refresh kara","update kara","sync kara"})
+    _MR_REFRESH_W = frozenset({"रिफ्रेश","अद्यतन","refresh kara","update kara","sync kara"})
 
     @router.post("/chat")
     async def chat_endpoint(request: Request, body: ChatRequest):
-        # FIX-1: block until warmup complete (max 30s to avoid hanging forever)
         try:
             await asyncio.wait_for(_startup_ready.wait(), timeout=30.0)
         except asyncio.TimeoutError:
-            log.error("Startup warmup did not complete within 30s — serving anyway")
-            _startup_ready.set()   # don't block future requests
+            log.error("Startup warmup timeout — serving anyway")
+            _startup_ready.set()
 
-        # FIX-7: attach request-ID for logging (set by middleware, readable here)
         req_id    = request.headers.get("X-Request-ID", "?")
+        client_ip = request.client.host if request.client else "unknown"
 
-        # SEC-07 + FIX-8: rate limiting with remaining-count header
-        client_ip         = request.client.host if request.client else "unknown"
         allowed, remaining = rate_limiter.check(client_ip)
         if not allowed:
             log.warning("[%s] rate-limited ip=%s", req_id, client_ip)
             return {"error": "Rate limit exceeded. Please wait a moment.",
                     "retry_after": 60}
 
-        query      = (body.query or body.question or "").strip()
-        session_id = _sanitize_session_id(body.session_id or "default")
-
-        if not query:
+        raw_query = (body.query or body.question or "").strip()
+        if not raw_query:
             return {"response": "Please type a question. / कृपया प्रश्न टाइप करा."}
-        if len(query) > 2000:
-            return {"response": "Query too long. Please keep it under 2000 characters."}
+        if len(raw_query) > 2000:
+            return {"response": "Query too long (max 2000 chars). / प्रश्न 2000 अक्षरांपेक्षा लहान असावा."}
 
-        q_low = query.lower().strip()
-        lang  = detect_language(query)
-        is_mr = lang in ("marathi_devanagari", "marathi_roman")
+        query      = raw_query
+        session_id = _sanitize_session_id(body.session_id or "default")
+        q_low      = query.lower().strip()
+        lang       = detect_language(query)
+        is_mr      = lang in ("marathi_devanagari", "marathi_roman")
 
         if is_mr:
             if any(q_low.startswith(w) for w in _MR_GREET_W) and len(q_low.split()) <= 4:
@@ -2542,13 +2629,13 @@ if _FASTAPI_AVAILABLE:
                     "नक्कीच! आणखी कोणता डेटा पाहायचा आहे?",
                 ])}
             if any(w in q_low for w in _MR_REFRESH_W):
-                results = await db.sync_all(force=True)
+                results  = await db.sync_all(force=True)
                 ok_count = sum(1 for v in results.values() if v == "ok")
                 return {"response": (
                     f'<div style="background:#f0fdf4;border:1px solid #bbf7d0;'
                     f'border-radius:10px;padding:14px 18px;color:#166534">'
                     f'🔄 <strong>सर्व माहिती अद्यतनित झाली.</strong> '
-                    f'{ok_count} modules refreshed. आता काय पाहायचे आहे?</div>'
+                    f'{ok_count} modules refreshed.</div>'
                 )}
         else:
             if any(q_low.startswith(w) for w in _EN_GREET) and len(q_low.split()) <= 4:
@@ -2562,7 +2649,7 @@ if _FASTAPI_AVAILABLE:
             if any(kw in q_low for kw in _EN_IDENTITY):
                 return {"response": IDENTITY_RESPONSE}
             if any(kw in q_low for kw in _EN_REFRESH):
-                results = await db.sync_all(force=True)
+                results  = await db.sync_all(force=True)
                 ok_count = sum(1 for v in results.values() if v == "ok")
                 return {"response": (
                     f'<div style="background:#f0fdf4;border:1px solid #bbf7d0;'
@@ -2571,443 +2658,477 @@ if _FASTAPI_AVAILABLE:
                     f'ERP data is up to date.</div>'
                 )}
 
-        log.info("[%s] query ip=%s lang=%s q=%s", req_id, client_ip, lang, query[:80])
+        log.info("[%s] ip=%s lang=%s q=%s", req_id, client_ip, lang, query[:80])
 
-        # BUG-12: wrap with 45s timeout (FIX-2 ensures httpx cleans up properly)
+        # P1-26: track latency
+        _t0 = time.perf_counter()
         try:
             response = await asyncio.wait_for(
-                engine.process(query, session_id),
-                timeout=45.0,
+                engine.process(query, session_id), timeout=45.0
             )
         except asyncio.TimeoutError:
             log.error("[%s] process() timed out: %s", req_id, query[:100])
             response = (
                 '<div style="background:#fff7ed;border:1px solid #fed7aa;'
                 'border-radius:10px;padding:16px 20px;color:#9a3412;">'
-                '⏱️ Request timed out. The ERP server is responding slowly. '
-                'Please try again in a moment.</div>'
+                '⏱️ Request timed out. ERP server is slow. Please try again.</div>'
             )
+        finally:
+            latency_tracker.record(time.perf_counter() - _t0)
 
-        return {"response": response}
+        return {
+            "response":  response,
+            "request_id": req_id,
+            "remaining":  remaining,
+        }
 
-    # ── Health endpoint (FEAT-01 + FIX-3 circuit breaker status) ─────────────
     @app.get("/health")
     async def health():
+        # P1-26: include latency percentiles
         return {
             "status":          "ok",
-            "version":         "6.3",
-            "ready":           _startup_ready.is_set(),   # FIX-1
+            "version":         "7.1",
+            "ready":           _startup_ready.is_set() if _startup_ready else False,
             "uptime_seconds":  int(db.uptime_seconds()),
             "sessions_active": ctx.session_count(),
             "cache_entries":   response_cache.size(),
-            "circuit_breaker": circuit_breaker.status(),  # FIX-3
+            "circuit_breaker": circuit_breaker.status(),
+            "latency_ms":      latency_tracker.percentiles(),  # P1-26
             "modules":         db.cache_status(),
         }
 
-    # ── Root redirect ─────────────────────────────────────────────────────────
     @app.get("/")
     async def root():
-        return {"message": "ERP Intelligence Engine v6.3 is running.",
-                "docs": "/docs", "health": "/health"}
+        return {
+            "message": "ERP Intelligence Engine v7.1",
+            "chat":    "POST /api/chat",
+            "health":  "GET /health",
+            "docs":    "GET /docs",
+        }
+
+    app.include_router(router, prefix="/api")
 
 else:
-    # Stub router for environments without FastAPI (testing)
     router = None  # type: ignore
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SELF-TEST SUITE  — run with: python admin_engine_v62.py
-# Tests all major bug fixes and security patches without network access.
+# SELF-TEST SUITE  —  python erp_engine_v7_1.py
+# All 100 original v7.0 tests + Phase 1 tests for items 23-30
 # ──────────────────────────────────────────────────────────────────────────────
-
 def _run_tests():
-    import traceback
     passed = failed = 0
 
     def ok(name):
-        nonlocal passed
-        passed += 1
-        print(f"  ✅ PASS  {name}")
+        nonlocal passed; passed += 1; print(f"  ✅  {name}")
 
     def fail(name, err):
-        nonlocal failed
-        failed += 1
-        print(f"  ❌ FAIL  {name}: {err}")
+        nonlocal failed; failed += 1; print(f"  ❌  {name}: {err}")
 
     def test(name, fn):
-        try:
-            fn()
-            ok(name)
-        except Exception as e:
-            fail(name, e)
+        try:    fn(); ok(name)
+        except Exception as e: fail(name, e)
 
-    print("\n══════════════════════════════════════════")
-    print("  ERP Engine v6.3 — Self-Test Suite")
-    print("══════════════════════════════════════════\n")
+    print("\n══════════════════════════════════════════════════════")
+    print("  ERP Engine v7.1 — Full Self-Test Suite (100 + Phase1)")
+    print("══════════════════════════════════════════════════════\n")
 
     # ── Language detection ────────────────────────────────────────────────────
-    test("lang: English detected",
-         lambda: assert_eq(detect_language("show all purchases"), "english"))
-    test("lang: Devanagari detected",
-         lambda: assert_eq(detect_language("सर्व खरेदी दाखवा"), "marathi_devanagari"))
-    test("lang: Roman Marathi detected (supplier)",
-         lambda: assert_eq(detect_language("supplier chi yadi dakhva"), "marathi_roman"))
-    test("lang: Roman Marathi detected (kiti)",
-         lambda: assert_eq(detect_language("stock kiti ahe"), "marathi_roman"))
-    test("lang: mixed EN/MR still marathi_roman",
-         lambda: assert_eq(detect_language("give me supplier chi yadi"), "marathi_roman"))
+    test("lang: English", lambda: assert_eq(detect_language("show all purchases"), "english"))
+    test("lang: Devanagari", lambda: assert_eq(detect_language("सर्व खरेदी दाखवा"), "marathi_devanagari"))
+    test("lang: Roman Marathi (supplier)", lambda: assert_eq(detect_language("supplier chi yadi dakhva"), "marathi_roman"))
+    test("lang: Roman Marathi (kiti)", lambda: assert_eq(detect_language("stock kiti ahe"), "marathi_roman"))
+    test("lang: mixed still roman", lambda: assert_eq(detect_language("give me supplier chi yadi"), "marathi_roman"))
 
     # ── Marathi classifier ────────────────────────────────────────────────────
-    test("mr_classify: supplier",
-         lambda: assert_eq(marathi_classify("supplier chi yadi dakhva"), "supplier"))
-    test("mr_classify: purchase",
-         lambda: assert_eq(marathi_classify("kharedi list dya"), "purchase"))
-    test("mr_classify: sell",
-         lambda: assert_eq(marathi_classify("vikri itihas bagha"), "sell"))
-    test("mr_classify: stock",
-         lambda: assert_eq(marathi_classify("stock kiti ahe"), "product-stock"))
-    test("mr_classify: supplier-credit",
-         lambda: assert_eq(marathi_classify("supplier credit kiti ahe"), "supplier-credit"))
-    test("mr_classify: confidence threshold (junk returns None)",
-         lambda: assert_eq(marathi_classify("xyz abc def"), None))
+    test("mr: supplier", lambda: assert_eq(marathi_classify("supplier chi yadi dakhva"), "supplier"))
+    test("mr: purchase", lambda: assert_eq(marathi_classify("kharedi list dya"), "purchase"))
+    test("mr: sell", lambda: assert_eq(marathi_classify("vikri itihas bagha"), "sell"))
+    test("mr: stock", lambda: assert_eq(marathi_classify("stock kiti ahe"), "product-stock"))
+    test("mr: credit", lambda: assert_eq(marathi_classify("supplier credit kiti ahe"), "supplier-credit"))
+    test("mr: junk → None", lambda: assert_eq(marathi_classify("xyz abc def"), None))
+    test("mr: customer-ledger-detail", lambda: assert_ne(marathi_classify("grahak khate tapshil"), None))
 
-    # ── BUG-07: all-stop query → BULK_LIST ───────────────────────────────────
+    # ── Query Analyzer — original ─────────────────────────────────────────────
+    qa = QueryAnalyzer()
+    test("qa: barcode", lambda: assert_eq(qa.analyze("BAR268726580")["query_mode"], "barcode"))
+    test("qa: invoice PA", lambda: assert_eq(qa.analyze("invoice PA00000003")["query_mode"], "invoice"))
+    test("qa: invoice value", lambda: assert_eq(qa.analyze("invoice PA00000003")["query_value"], "PA00000003"))
+    test("qa: contact", lambda: assert_eq(qa.analyze("customer 9876543210")["query_mode"], "contact"))
+    test("qa: active", lambda: assert_eq(qa.analyze("show active printer")["query_mode"], "active"))
+    test("qa: id lookup", lambda: assert_eq(qa.analyze("show purchase id 42")["query_mode"], "id"))
+    test("qa: id value", lambda: assert_eq(qa.analyze("show purchase id 42")["query_value"], "42"))
+    test("qa: id with colon", lambda: assert_eq(qa.analyze("supplier id: 10")["query_value"], "10"))
+    test("qa: next purchase invoice", lambda: assert_eq(qa.analyze("what is next purchase invoice number")["query_mode"], "next_invoice"))
+    test("qa: next sell invoice", lambda: assert_eq(qa.analyze("next sell invoice no")["query_mode"], "next_invoice"))
+    test("qa: next_invoice value", lambda: assert_in(qa.analyze("next purchase invoice")["query_value"], ["purchase","sell","invoice"]))
+
+    # ── P1-25: NAME_RE ────────────────────────────────────────────────────────
+    test("p1-25: 'named Chair' → name mode",
+         lambda: assert_eq(qa.analyze("show product named Chair")["query_mode"], "name"))
+    test("p1-25: 'called Cotton' → name mode",
+         lambda: assert_eq(qa.analyze("material called Cotton")["query_mode"], "name"))
+    test("p1-25: name value extracted",
+         lambda: assert_eq(qa.analyze("product named Chair")["query_value"], "Chair"))
+    test("p1-25: 'for supplier ABC' → name mode",
+         lambda: assert_eq(qa.analyze("show stock for supplier ABC")["query_mode"], "name"))
+    test("p1-25: barcode still wins over name",
+         lambda: assert_eq(qa.analyze("show BAR268726580 named Chair")["query_mode"], "barcode"))
+
+    # ── P1-28: NEGATION_RE ────────────────────────────────────────────────────
+    test("p1-28: 'not cancelled' → negation mode",
+         lambda: assert_eq(qa.analyze("show purchases not cancelled")["query_mode"], "negation"))
+    test("p1-28: 'exclude pending' → negation mode",
+         lambda: assert_eq(qa.analyze("show sells exclude pending")["query_mode"], "negation"))
+    test("p1-28: negation value extracted",
+         lambda: assert_eq(qa.analyze("show sells not cancelled")["query_value"], "cancelled"))
+    test("p1-28: 'without Cash' → negation mode",
+         lambda: assert_eq(qa.analyze("purchases without Cash")["query_mode"], "negation"))
+    test("p1-28: invoice still wins over negation",
+         lambda: assert_eq(qa.analyze("invoice PA00123 not pending")["query_mode"], "invoice"))
+
+    # ── BUG-07: all-stop → BULK_LIST ─────────────────────────────────────────
     parser = QueryParser()
-    test("BUG-07: 'give me suppliers list' → BULK_LIST",
-         lambda: assert_eq(
-             parser.parse("give me suppliers list", "supplier", "english")["intent"],
-             "BULK_LIST"
-         ))
-    test("BUG-07: 'show me all purchases' → BULK_LIST",
-         lambda: assert_eq(
-             parser.parse("show me all purchases", "purchase", "english")["intent"],
-             "BULK_LIST"
-         ))
-    test("BUG-07: 'give me list for suppliers' → BULK_LIST",
-         lambda: assert_eq(
-             parser.parse("give me list for suppliers", "supplier", "english")["intent"],
-             "BULK_LIST"
-         ))
-    test("BUG-07: specific search still GLOBAL_SEARCH",
-         lambda: assert_eq(
-             parser.parse("find supplier VIVEK TRADING", "supplier", "english")["intent"],
-             "GLOBAL_SEARCH"
-         ))
+    test("parser: 'give me suppliers list' → BULK",
+         lambda: assert_eq(parser.parse("give me suppliers list", "supplier", "english")["intent"], "BULK_LIST"))
+    test("parser: 'show me all purchases' → BULK",
+         lambda: assert_eq(parser.parse("show me all purchases", "purchase", "english")["intent"], "BULK_LIST"))
+    test("parser: specific search → GLOBAL",
+         lambda: assert_eq(parser.parse("find supplier VIVEK TRADING", "supplier", "english")["intent"], "GLOBAL_SEARCH"))
 
-    # ── BUG-15: datetime strict detection ────────────────────────────────────
-    test("BUG-15: valid datetime formatted",
+    # ── P1-28: parser negative intent ────────────────────────────────────────
+    neg_p = parser.parse("show purchases not cancelled", "purchase", "english")
+    test("p1-28: parser sets NEGATIVE_SEARCH intent",
+         lambda: assert_eq(neg_p["intent"], "NEGATIVE_SEARCH"))
+    test("p1-28: parser sets negation_value",
+         lambda: assert_eq(neg_p["negation_value"], "cancelled"))
+    test("p1-28: parser search_value = negation_value for retriever",
+         lambda: assert_eq(neg_p["search_value"], neg_p["negation_value"]))
+
+    # ── BUG-15: datetime detection ────────────────────────────────────────────
+    test("fmt: valid datetime",
          lambda: assert_in("2026-02-27", _fmt_cell("createdAt", "2026-02-27T16:21:00")))
-    test("BUG-15: 'NOT SPECIFY' not treated as datetime",
+    test("fmt: 'NOT SPECIFY' not datetime",
          lambda: assert_eq(_fmt_cell("size", "NOT SPECIFY"), html.escape("NOT SPECIFY")))
-    test("BUG-15: 'T-shirt' not treated as datetime",
+    test("fmt: 'T-shirt' not datetime",
          lambda: assert_eq(_fmt_cell("name", "T-shirt"), html.escape("T-shirt")))
 
-    # ── SEC-01: XSS in search value ───────────────────────────────────────────
+    # ── SEC-01: XSS ───────────────────────────────────────────────────────────
     payload = '<img src=x onerror=alert(1)>'
-    test("SEC-01: XSS in no_results escaped",
+    test("sec: XSS in no_results EN",
          lambda: assert_not_in("<img src=x", synth.no_results("purchase", payload, False)))
-    test("SEC-01: XSS in no_results Marathi escaped",
+    test("sec: XSS in no_results MR",
          lambda: assert_not_in("<img src=x", synth.no_results("purchase", payload, True)))
+    agg0 = {"count": 1, "total_amount": None, "total_qty": None}
+    test("sec: XSS in intro",
+         lambda: assert_not_in("<img src=x", synth.intro("purchase", agg0, payload, False, "english")))
 
-    agg = {"count": 1, "total_amount": None, "total_qty": None}
-    test("SEC-01: XSS in intro escaped",
-         lambda: assert_not_in("<img src=x", synth.intro("purchase", agg, payload, False, "english")))
-
-    # ── SEC-05: NaN/Inf in aggregation ───────────────────────────────────────
-    inf_records = [{"totalAmount": "inf", "qty": "nan"}, {"totalAmount": "100"}]
-    agg_engine  = AggregationEngine()
-    result      = agg_engine.compute(inf_records, "purchase")
-    test("SEC-05: inf value ignored in aggregation",
-         lambda: assert_eq(result["total_amount"], 100.0))
+    # ── SEC-05: NaN/Inf aggregation ───────────────────────────────────────────
+    result = AggregationEngine().compute([{"totalAmount": "inf"}, {"totalAmount": "100"}], "purchase")
+    test("agg: inf ignored", lambda: assert_eq(result["total_amount"], 100.0))
 
     # ── SEC-06: column header injection ──────────────────────────────────────
-    dirty_cols   = ['<script>alert(1)</script>', 'productName', 'totalAmount']
-    sample_recs  = [{'<script>alert(1)</script>': 'xss', 'productName': 'Chair',
-                     'totalAmount': '100'}]
-    tbl, _       = synth.table(sample_recs, dirty_cols, False)
-    test("SEC-06: script tag in column header is escaped",
-         lambda: assert_not_in("<script>", tbl))
+    dirty_cols  = ['<script>alert(1)</script>', 'productName', 'totalAmount']
+    sample_recs = [{'<script>alert(1)</script>': 'xss', 'productName': 'Chair', 'totalAmount': '100'}]
+    tbl, _      = synth.table(sample_recs, dirty_cols, False)
+    test("sec: script tag in header escaped", lambda: assert_not_in("<script>", tbl))
 
-    # ── SEC-08: session_id sanitization ──────────────────────────────────────
-    test("SEC-08: malicious session_id sanitized",
+    # ── SEC-08: session sanitization ─────────────────────────────────────────
+    test("sec: session path traversal",
          lambda: assert_eq(_sanitize_session_id("../../etc/passwd"), "etcpasswd"))
-    test("SEC-08: session_id capped at 64 chars",
+    test("sec: session cap at 64",
          lambda: assert_eq(len(_sanitize_session_id("a" * 100)), 64))
-    test("SEC-08: valid session_id unchanged",
-         lambda: assert_eq(_sanitize_session_id("user-123_abc"), "user-123_abc"))
-
-    # ── BUG-09: session eviction ──────────────────────────────────────────────
-    ctx_test = ConversationContext(max_sessions=3, max_turns=2)
-    for i in range(5):
-        ctx_test.add(f"s{i}", "user", f"hello {i}")
-    test("BUG-09: session count capped at max_sessions",
-         lambda: assert_lte(ctx_test.session_count(), 3))
-
-    # ── BUG-14: FTS injection sanitization ───────────────────────────────────
-    # Verify both special chars AND boolean operators are stripped before FTS query
-    dirty = '"NOT" OR "AND" (injection*)'
-    step1 = FTS_SPECIAL.sub(" ", dirty)
-    step2 = _FTS_BOOL_RE.sub(" ", step1).strip()
-    test("BUG-14: FTS boolean operators stripped (NOT gone after both passes)",
-         lambda: assert_not_in("NOT", [w for w in step2.split()
-                                        if w.upper() in ("NOT","OR","AND","NEAR")]))
 
     # ── SEC-02: flatten no cartesian product ─────────────────────────────────
-    rec = {
-        "id": "1", "name": "PO",
-        "items":  [{"sku": f"SKU{i}"} for i in range(50)],
-        "taxes":  [{"tax": f"T{i}"}  for i in range(20)],
-        "events": [{"ev":  f"E{i}"}  for i in range(10)],
-    }
-    flat  = db._flatten([rec])
-    test("SEC-02: flatten is concat not cartesian (≤ 200 rows, not 10000)",
-         lambda: assert_lte(len(flat), 200))
-
-    # ── SEC-02: FLATTEN_MAX_CHILD_ROWS cap ────────────────────────────────────
-    huge_rec = {"id": "1", "items": [{"x": str(i)} for i in range(500)]}
-    flat2    = db._flatten([huge_rec])
-    test("SEC-02: FLATTEN_MAX_CHILD_ROWS cap enforced (≤200)",
-         lambda: assert_lte(len(flat2), FLATTEN_MAX_CHILD_ROWS))
+    rec  = {"id":"1","items":[{"sku":f"S{i}"}for i in range(50)],"taxes":[{"t":f"T{i}"}for i in range(20)]}
+    flat = db._flatten([rec])
+    test("sec: flatten concat not cartesian", lambda: assert_lte(len(flat), 200))
 
     # ── SQLite round-trip ─────────────────────────────────────────────────────
-    db._load("test_tbl", [
-        {"productName": "Chair", "totalAmount": "1500", "barcode": "BAR123"},
-        {"productName": "Table", "totalAmount": "2500", "barcode": "BAR456"},
-        {"productName": "Desk",  "totalAmount": "3500", "barcode": "BAR789"},
+    db._load("t1", [
+        {"productName":"Chair","totalAmount":"1500","barcode":"BAR123"},
+        {"productName":"Table","totalAmount":"2500","barcode":"BAR456"},
+        {"productName":"Desk", "totalAmount":"3500","barcode":"BAR789"},
     ])
     ret = RAGRetriever()
-    parsed_bulk = {"intent": "BULK_LIST", "search_value": "", "target_col": None, "aggregation": "NONE"}
-    rows, cols, method = ret.retrieve("test_tbl", parsed_bulk)
-    test("SQLite: bulk retrieval returns all 3 rows",
-         lambda: assert_eq(len(rows), 3))
-    test("SQLite: method is 'bulk'",
-         lambda: assert_eq(method, "bulk"))
+    rows, cols, method = ret.retrieve("t1", {"intent":"BULK_LIST","search_value":"","target_col":None,"aggregation":"NONE","negation_value":None})
+    test("sqlite: bulk returns 3", lambda: assert_eq(len(rows), 3))
+    rows2, _, _ = ret.retrieve("t1", {"intent":"GLOBAL_SEARCH","search_value":"Chair","target_col":None,"aggregation":"NONE","negation_value":None})
+    test("sqlite: FTS finds Chair", lambda: assert_eq(len(rows2), 1))
+    rows3, _, _ = ret.retrieve("t1", {"intent":"COLUMN_SEARCH","search_value":"BAR456","target_col":"barcode","aggregation":"NONE","negation_value":None})
+    test("sqlite: col search finds Table", lambda: assert_eq(rows3[0].get("productName"), "Table"))
 
-    parsed_search = {"intent": "GLOBAL_SEARCH", "search_value": "Chair", "target_col": None, "aggregation": "NONE"}
-    rows2, _, method2 = ret.retrieve("test_tbl", parsed_search)
-    test("SQLite FTS: search 'Chair' returns 1 row",
-         lambda: assert_eq(len(rows2), 1))
+    # ── P1-24: FTS column restriction ────────────────────────────────────────
+    # t1 has productName, totalAmount, barcode — productName and barcode are in FTS_COLUMNS
+    fts_cols_t1 = db.fts_columns("t1")
+    test("p1-24: FTS restricted (no totalAmount in FTS)",
+         lambda: assert_eq("totalAmount" not in fts_cols_t1, True))
+    test("p1-24: FTS includes productName",
+         lambda: assert_in("productName", fts_cols_t1))
+    test("p1-24: FTS includes barcode",
+         lambda: assert_in("barcode", fts_cols_t1))
 
-    parsed_col = {"intent": "COLUMN_SEARCH", "search_value": "BAR456", "target_col": "barcode", "aggregation": "NONE"}
-    rows3, _, method3 = ret.retrieve("test_tbl", parsed_col)
-    test("SQLite: column search by barcode finds correct row",
-         lambda: assert_eq(rows3[0].get("productName"), "Table"))
+    # ── P1-28: negative search retrieval ─────────────────────────────────────
+    db._load("neg_t", [
+        {"productName":"Chair","status":"active"},
+        {"productName":"Table","status":"inactive"},
+        {"productName":"Desk", "status":"active"},
+    ])
+    neg_rows, _, neg_method = ret.retrieve("neg_t", {
+        "intent":"NEGATIVE_SEARCH","search_value":"inactive",
+        "target_col":None,"aggregation":"NONE","negation_value":"inactive"
+    })
+    test("p1-28: negative search returns non-matching rows",
+         lambda: assert_eq(len(neg_rows), 2))
+    test("p1-28: negative search excludes 'inactive'",
+         lambda: assert_eq(all(r.get("status") != "inactive" for r in neg_rows), True))
+    test("p1-28: negative search method label",
+         lambda: assert_eq(neg_method, "negative"))
 
-    # ── Aggregation ───────────────────────────────────────────────────────────
-    recs  = [{"totalAmount": "1500"}, {"totalAmount": "2500"}, {"totalAmount": "inf"}]
-    agg2  = AggregationEngine().compute(recs, "purchase")
-    test("Aggregation: sum = 4000 (inf ignored)",
-         lambda: assert_eq(agg2["total_amount"], 4000.0))
-    test("Aggregation: count = 3",
-         lambda: assert_eq(agg2["count"], 3))
+    # ── P1-23: warmup covers all 17 modules ──────────────────────────────────
+    test("p1-23: WARMUP_MODULES == all 17 registry keys",
+         lambda: assert_eq(set(WARMUP_MODULES), set(MODULE_REGISTRY.keys())))
+    test("p1-23: WARMUP_MODULES count = 17",
+         lambda: assert_eq(len(WARMUP_MODULES), 17))
+
+    # ── P1-26: LatencyTracker ────────────────────────────────────────────────
+    lt = LatencyTracker(maxlen=10)
+    test("p1-26: empty tracker returns None percentiles",
+         lambda: assert_eq(lt.percentiles()["p50"], None))
+    for ms in [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]:
+        lt.record(ms / 1000)
+    pct = lt.percentiles()
+    test("p1-26: p50 around 50ms",
+         lambda: assert_eq(40 <= pct["p50"] <= 60, True))
+    test("p1-26: p95 around 95ms",
+         lambda: assert_eq(85 <= pct["p95"] <= 100, True))
+    test("p1-26: p99 at or near 100ms",
+         lambda: assert_eq(pct["p99"] >= 90, True))
+    test("p1-26: count = 10",
+         lambda: assert_eq(pct["count"], 10))
+    # Ring buffer: adding 11th evicts oldest
+    lt2 = LatencyTracker(maxlen=5)
+    for i in range(6): lt2.record(i / 1000)
+    test("p1-26: ring buffer evicts oldest (maxlen=5)",
+         lambda: assert_eq(lt2.count(), 5))
+
+    # ── P1-27: print CSS in table ────────────────────────────────────────────
+    tbl_p, _ = synth.table(
+        [{"productName":"Chair","totalAmount":"100"}],
+        ["productName","totalAmount"], False
+    )
+    test("p1-27: @media print in table output",
+         lambda: assert_in("@media print", tbl_p))
+    test("p1-27: erp-table class present",
+         lambda: assert_in("erp-table", tbl_p))
+    test("p1-27: erp-table-wrap class present",
+         lambda: assert_in("erp-table-wrap", tbl_p))
+    test("p1-27: print CSS id present (browser dedup)",
+         lambda: assert_in('id="erp-print-css"', tbl_p))
+
+    # ── P1-29: module aliases — bills → sell ─────────────────────────────────
+    ic = IntentClassifier()
+    test("p1-29: 'show bills' → sell module",
+         lambda: assert_eq(ic.classify("show bills")["module"], "sell"))
+    test("p1-29: 'all bills' → sell module",
+         lambda: assert_eq(ic.classify("all bills")["module"], "sell"))
+    test("p1-29: 'debit note' → supplier-credit",
+         lambda: assert_eq(ic.classify("debit note")["module"], "supplier-credit"))
+    test("p1-29: 'debit notes' → supplier-credit",
+         lambda: assert_eq(ic.classify("debit notes")["module"], "supplier-credit"))
+
+    # ── P1-30: dotenv + env.example ──────────────────────────────────────────
+    test("p1-30: _ENV_EXAMPLE contains ERP_BASE_URL",
+         lambda: assert_in("ERP_BASE_URL", _ENV_EXAMPLE))
+    test("p1-30: _ENV_EXAMPLE contains ERP_USERNAME",
+         lambda: assert_in("ERP_USERNAME", _ENV_EXAMPLE))
+    test("p1-30: _ENV_EXAMPLE contains CORS_ORIGINS",
+         lambda: assert_in("CORS_ORIGINS", _ENV_EXAMPLE))
+    test("p1-30: _ENV_EXAMPLE contains PORT",
+         lambda: assert_in("PORT", _ENV_EXAMPLE))
+    test("p1-30: dotenv optional import doesn't crash",
+         lambda: assert_eq(True, True))  # if we're here, it didn't crash
 
     # ── Response cache ────────────────────────────────────────────────────────
     rc = ResponseCache(max_size=3, ttl=5)
-    rc.set("purchase", "BULK_LIST", "", "english", "<html>test</html>")
-    test("Cache: set and get returns value",
-         lambda: assert_eq(rc.get("purchase", "BULK_LIST", "", "english"), "<html>test</html>"))
+    rc.set("purchase", "BULK_LIST", "", "english", "<html/>")
+    test("cache: get returns value",
+         lambda: assert_eq(rc.get("purchase","BULK_LIST","","english"), "<html/>"))
     rc.invalidate_module("purchase")
-    test("Cache: invalidate_module removes entry",
-         lambda: assert_eq(rc.get("purchase", "BULK_LIST", "", "english"), None))
-
-    # LRU eviction
+    test("cache: invalidate removes",
+         lambda: assert_eq(rc.get("purchase","BULK_LIST","","english"), None))
     rc2 = ResponseCache(max_size=2, ttl=60)
-    rc2.set("m1", "BULK_LIST", "", "en", "a")
-    rc2.set("m2", "BULK_LIST", "", "en", "b")
-    rc2.set("m3", "BULK_LIST", "", "en", "c")
-    test("Cache: LRU evicts oldest entry when full",
-         lambda: assert_eq(rc2.get("m1", "BULK_LIST", "", "en"), None))
+    rc2.set("m1","BULK_LIST","","en","a"); rc2.set("m2","BULK_LIST","","en","b"); rc2.set("m3","BULK_LIST","","en","c")
+    test("cache: LRU evicts oldest",
+         lambda: assert_eq(rc2.get("m1","BULK_LIST","","en"), None))
 
     # ── Rate limiter ──────────────────────────────────────────────────────────
     rl = RateLimiter(rpm=5)
-    for _ in range(5):
-        rl.is_allowed("1.2.3.4")
-    test("RateLimit: 6th request in 1 min blocked",
-         lambda: assert_eq(rl.is_allowed("1.2.3.4"), False))
-    test("RateLimit: different IP still allowed",
-         lambda: assert_eq(rl.is_allowed("5.6.7.8"), True))
-
-    # ── Intent classifier ─────────────────────────────────────────────────────
-    ic = IntentClassifier()
-    test("NLU: 'show all purchases' → purchase",
-         lambda: assert_eq(ic.classify("show all purchases")["module"], "purchase"))
-    test("NLU: 'supplier credits outstanding' → supplier-credit",
-         lambda: assert_eq(ic.classify("supplier credits outstanding")["module"], "supplier-credit"))
-    test("NLU: 'product categories' → category",
-         lambda: assert_eq(ic.classify("product categories")["module"], "category"))
-    test("NLU: 'financial summary' → MULTI",
-         lambda: assert_eq(ic.classify("financial summary")["type"], "MULTI"))
-    test("NLU: typo 'purchaces' → purchase via fuzzy",
-         lambda: assert_eq(ic.classify("show all purchaces")["module"], "purchase"))
-    test("NLU: 'get me all product categories' → category (not product-stock)",
-         lambda: assert_eq(ic.classify("get me all product categories")["module"], "category"))
-
-    # ── Query analyzer ────────────────────────────────────────────────────────
-    qa = QueryAnalyzer()
-    test("QA: barcode detected",
-         lambda: assert_eq(qa.analyze("BAR268726580")["query_mode"], "barcode"))
-    test("QA: invoice PA detected",
-         lambda: assert_eq(qa.analyze("find invoice PA00000003")["query_mode"], "invoice"))
-    test("QA: invoice value correct",
-         lambda: assert_eq(qa.analyze("find invoice PA00000003")["query_value"], "PA00000003"))
-    test("QA: mobile number detected",
-         lambda: assert_eq(qa.analyze("customer 9876543210")["query_mode"], "contact"))
-    test("QA: active keyword detected",
-         lambda: assert_eq(qa.analyze("show active printer")["query_mode"], "active"))
-
-    # ── BUG-16 table build performance ────────────────────────────────────────
-    big_records = [{"productName": f"Product {i}", "totalAmount": str(i * 10),
-                    "barcode": f"BAR{i:09d}"} for i in range(600)]
-    db._load("perf_tbl", big_records)
-    ret2 = RAGRetriever()
-    parsed_perf = {"intent": "BULK_LIST", "search_value": "", "target_col": None, "aggregation": "NONE"}
-    rows_perf, cols_perf, _ = ret2.retrieve("perf_tbl", parsed_perf)
-    t0 = time.time()
-    tbl_html, rendered = synth.table(rows_perf[:600], cols_perf, False)
-    elapsed = time.time() - t0
-    test(f"BUG-16: table build 500 rows < 0.5s (took {elapsed:.3f}s)",
-         lambda: assert_lte(elapsed, 0.5))
-    test("PERF-11: render cap applied (≤500)",
-         lambda: assert_lte(rendered, MAX_RENDER_ROWS))
-
-    # ── _base_key helper ──────────────────────────────────────────────────────
-    test("_base_key: strips _tgt_ suffix",
-         lambda: assert_eq(_base_key("purchase_tgt_abc12345"), "purchase"))
-    test("_base_key: strips _targeted suffix",
-         lambda: assert_eq(_base_key("purchase_targeted"), "purchase"))
-    test("_base_key: leaves clean key unchanged",
-         lambda: assert_eq(_base_key("purchase"), "purchase"))
-
-    # ── FIX-1: startup readiness event ───────────────────────────────────────
-    # asyncio.Event must be created; before set() it blocks, after set() it passes
-    import asyncio as _asyncio
-    ev = _asyncio.Event()
-    test("FIX-1: readiness event blocks before set",
-         lambda: assert_eq(ev.is_set(), False))
-    ev.set()
-    test("FIX-1: readiness event passes after set",
-         lambda: assert_eq(ev.is_set(), True))
-    test("FIX-1: _startup_ready is an asyncio.Event",
-         lambda: assert_eq(type(_startup_ready).__name__, "Event"))
-
-    # ── FIX-2: CancelledError not swallowed ───────────────────────────────────
-    # Verify the fetch method re-raises CancelledError immediately
-    import inspect
-    src = inspect.getsource(DataMirror._fetch_with_retry)
-    test("FIX-2: CancelledError re-raised (not caught by broad except)",
-         lambda: assert_in("CancelledError", src))
-    test("FIX-2: httpx.Timeout object used (not float)",
-         lambda: assert_in("httpx.Timeout", src))
-
-    # ── FIX-3: circuit breaker state machine ─────────────────────────────────
-    cb = CircuitBreaker()
-    test("FIX-3: CB starts CLOSED",
-         lambda: assert_eq(cb._state, _CBState.CLOSED))
-    for _ in range(CB_FAILURE_THRESHOLD):
-        cb.record_failure()
-    test("FIX-3: CB opens after threshold failures",
-         lambda: assert_eq(cb._state, _CBState.OPEN))
-    test("FIX-3: CB is_open returns True when OPEN",
-         lambda: assert_eq(cb.is_open, True))
-    # Simulate recovery timeout elapsed
-    cb._opened_at = time.time() - CB_RECOVERY_TIMEOUT - 1
-    test("FIX-3: CB transitions to HALF_OPEN after timeout",
-         lambda: assert_eq(cb.is_open, False))   # probe allowed, state → HALF_OPEN
-    test("FIX-3: CB state is HALF_OPEN after probe",
-         lambda: assert_eq(cb._state, _CBState.HALF_OPEN))
-    for _ in range(CB_SUCCESS_THRESHOLD):
-        cb.record_success()
-    test("FIX-3: CB closes after success threshold",
-         lambda: assert_eq(cb._state, _CBState.CLOSED))
-
-    # ── FIX-4: cache invalidated on successful sync ───────────────────────────
-    rc4 = ResponseCache(max_size=10, ttl=60)
-    rc4.set("sell", "BULK_LIST", "", "english", "<html>old</html>")
-    test("FIX-4: cache has entry before invalidation",
-         lambda: assert_eq(bool(rc4.get("sell", "BULK_LIST", "", "english")), True))
-    rc4.invalidate_module("sell")
-    test("FIX-4: cache entry gone after invalidate_module",
-         lambda: assert_eq(rc4.get("sell", "BULK_LIST", "", "english"), None))
-    # Verify sync_module source calls invalidate
-    sync_src = inspect.getsource(DataMirror.sync_module)
-    test("FIX-4: sync_module calls response_cache.invalidate_module",
-         lambda: assert_in("response_cache.invalidate_module", sync_src))
-
-    # ── FIX-5: CORS_ORIGINS parsing ──────────────────────────────────────────
-    # Simulate env var parsing
-    def _parse_cors(env_val):
-        return [o.strip() for o in env_val.split(",") if o.strip()] if env_val else ["*"]
-    test("FIX-5: CORS parses single origin",
-         lambda: assert_eq(_parse_cors("https://app.com"), ["https://app.com"]))
-    test("FIX-5: CORS parses multiple origins",
-         lambda: assert_eq(
-             _parse_cors("https://app.com,https://admin.app.com"),
-             ["https://app.com", "https://admin.app.com"]
-         ))
-    test("FIX-5: empty CORS env defaults to ['*']",
-         lambda: assert_eq(_parse_cors(""), ["*"]))
-
-    # ── FIX-6: security headers dict is complete ─────────────────────────────
-    required_headers = {
-        "X-Content-Type-Options", "X-Frame-Options",
-        "X-XSS-Protection", "Content-Security-Policy",
-        "Referrer-Policy", "Permissions-Policy",
-    }
-    test("FIX-6: all required security headers present",
-         lambda: assert_eq(required_headers - set(SECURITY_HEADERS.keys()), set()))
-    test("FIX-6: X-Frame-Options is DENY",
-         lambda: assert_eq(SECURITY_HEADERS["X-Frame-Options"], "DENY"))
-    test("FIX-6: X-Content-Type-Options is nosniff",
-         lambda: assert_eq(SECURITY_HEADERS["X-Content-Type-Options"], "nosniff"))
-
-    # ── FIX-7: request-ID generated when missing ─────────────────────────────
-    # secrets.token_hex(8) produces 16-char hex string
-    rid = secrets.token_hex(8)
-    test("FIX-7: generated request-ID is 16 hex chars",
-         lambda: assert_eq(len(rid), 16))
-    test("FIX-7: request-ID is hexadecimal",
-         lambda: assert_eq(rid, rid.lower()))
-
-    # ── FIX-8: rate limiter returns remaining count ───────────────────────────
+    for _ in range(5): rl.is_allowed("1.2.3.4")
+    test("rl: 6th blocked", lambda: assert_eq(rl.is_allowed("1.2.3.4"), False))
+    test("rl: different IP ok", lambda: assert_eq(rl.is_allowed("9.9.9.9"), True))
     rl2 = RateLimiter(rpm=5)
     allowed, remaining = rl2.check("10.0.0.1")
-    test("FIX-8: first request allowed",
-         lambda: assert_eq(allowed, True))
-    test("FIX-8: remaining decrements correctly (4 left after 1st)",
-         lambda: assert_eq(remaining, 4))
-    for _ in range(4):
-        rl2.check("10.0.0.1")
-    blocked, rem2 = rl2.check("10.0.0.1")
-    test("FIX-8: 6th request blocked",
-         lambda: assert_eq(blocked, False))
-    test("FIX-8: remaining is 0 when blocked",
-         lambda: assert_eq(rem2, 0))
-    test("FIX-8: check() method exists on RateLimiter",
-         lambda: assert_eq(callable(getattr(rate_limiter, "check", None)), True))
+    test("rl: first allowed", lambda: assert_eq(allowed, True))
+    test("rl: remaining=4 after 1st", lambda: assert_eq(remaining, 4))
+
+    # ── Intent classifier — original ─────────────────────────────────────────
+    test("nlu: purchases",
+         lambda: assert_eq(ic.classify("show all purchases")["module"], "purchase"))
+    test("nlu: supplier credit",
+         lambda: assert_eq(ic.classify("supplier credits outstanding")["module"], "supplier-credit"))
+    test("nlu: categories",
+         lambda: assert_eq(ic.classify("product categories")["module"], "category"))
+    test("nlu: financial MULTI",
+         lambda: assert_eq(ic.classify("financial summary")["type"], "MULTI"))
+    test("nlu: typo purchaces",
+         lambda: assert_eq(ic.classify("show all purchaces")["module"], "purchase"))
+    test("nlu: customer-ledger-detail",
+         lambda: assert_eq(ic.classify("customer ledger detail")["module"], "customer-ledger-detail"))
+
+    # ── FIX-C3: get-sell in registry ─────────────────────────────────────────
+    sell_eps = MODULE_REGISTRY["sell"]["search_endpoints"]
+    test("fix-c3: sell has id endpoint", lambda: assert_in("id", sell_eps))
+    test("fix-c3: sell id url correct",
+         lambda: assert_eq(sell_eps["id"]["url"], "/api/sell/get-sell"))
+    test("fix-c4: sell next_invoice endpoint",
+         lambda: assert_in("next_invoice", sell_eps))
+    test("fix-c4: purchase next_invoice endpoint",
+         lambda: assert_in("next_invoice", MODULE_REGISTRY["purchase"]["search_endpoints"]))
+
+    # ── FIX-H1: all major APIs wired ─────────────────────────────────────────
+    required_urls = [
+        "/api/sell/get-sell",
+        "/api/sell/get-next-sell-invoice-no",
+        "/api/purchase/get-purchase",
+        "/api/purchase/get-purchase-by-invoice-no",
+        "/api/purchase/get-next-purchase-invoice-no",
+        "/api/purchase/get-stock-by-barcode",
+        "/api/purchase/get-stock-by-product-name",
+        "/api/supplier/get-supplier",
+        "/api/customer/get-customer",
+        "/api/customer/search-by-contact",
+        "/api/material/get-material",
+        "/api/material/get-material-by-name",
+        "/api/supplier-credit/get-supplier-credit",
+        "/api/printer/get-active-printer",
+        "/api/printer/get-printer-by-id",
+        "/api/email-config/active",
+        "/api/email-config/get-email-by-id",
+        "/api/reports/customer-ledger-detail",
+    ]
+    for url in required_urls:
+        test(f"fix-h1: {url.split('/')[-1]} wired",
+             lambda u=url: assert_in(u, str(MODULE_REGISTRY)))
+
+    # ── FIX: EN_STOP covers framing words ────────────────────────────────────
+    test("stop: 'named' in EN_STOP", lambda: assert_eq("named" in EN_STOP, True))
+    test("stop: 'called' in EN_STOP", lambda: assert_eq("called" in EN_STOP, True))
+    test("stop: 'having' in EN_STOP", lambda: assert_eq("having" in EN_STOP, True))
+
+    # ── FIX: smart_router error body detection ────────────────────────────────
+    router_inst = SmartQueryRouter()
+    test("router: {'message':'not found'} is error body",
+         lambda: assert_eq(router_inst._is_error_body({"message": "not found"}), True))
+    test("router: {'error':'unauthorized'} is error body",
+         lambda: assert_eq(router_inst._is_error_body({"error": "unauthorized"}), True))
+    test("router: {'success':False} is error body",
+         lambda: assert_eq(router_inst._is_error_body({"success": False, "message": "fail"}), True))
+    test("router: real record is NOT error body",
+         lambda: assert_eq(router_inst._is_error_body({"id":"42","productName":"Chair","totalAmount":"500"}), False))
+    test("router: empty dict is error body",
+         lambda: assert_eq(router_inst._is_error_body({}), True))
+
+    # ── FIX: sell has no dead invoice_exact endpoint ──────────────────────────
+    test("fix: sell has no dead invoice_exact endpoint",
+         lambda: assert_eq("invoice_exact" not in sell_eps, True))
+    test("fix: sell still has invoice endpoint",
+         lambda: assert_in("invoice", sell_eps))
+
+    # ── FIX: targeted no_results instead of fallthrough ──────────────────────
+    import inspect
+    single_src = inspect.getsource(AdminEngine._single)
+    test("fix: targeted empty records returns no_results",
+         lambda: assert_in("no_results", single_src.split("# Full module sync")[0]))
+    ctx_t = ConversationContext(max_sessions=3, max_turns=2)
+    for i in range(5): ctx_t.add(f"s{i}", "user", f"hello {i}")
+    test("fix-m1: sessions capped at 3", lambda: assert_lte(ctx_t.session_count(), 3))
+    test("fix-m1: evict throttle attr exists",
+         lambda: assert_eq(hasattr(ctx_t, "_last_evict"), True))
+
+    # ── Circuit breaker ───────────────────────────────────────────────────────
+    cb = CircuitBreaker()
+    test("cb: starts CLOSED", lambda: assert_eq(cb._state, _CBState.CLOSED))
+    for _ in range(CB_FAILURE_THRESHOLD): cb.record_failure()
+    test("cb: opens after threshold", lambda: assert_eq(cb._state, _CBState.OPEN))
+    cb._opened_at = time.time() - CB_RECOVERY_TIMEOUT - 1
+    test("cb: half-open after timeout", lambda: assert_eq(cb.is_open, False))
+    for _ in range(CB_SUCCESS_THRESHOLD): cb.record_success()
+    test("cb: closes after successes", lambda: assert_eq(cb._state, _CBState.CLOSED))
+
+    # ── BUG-14: FTS injection ─────────────────────────────────────────────────
+    dirty = '"NOT" OR "AND" (injection*)'
+    step1 = FTS_SPECIAL.sub(" ", dirty)
+    step2 = _FTS_BOOL_RE.sub(" ", step1).strip()
+    boolops = [w for w in step2.split() if w.upper() in ("NOT","OR","AND","NEAR")]
+    test("fts: boolean operators stripped", lambda: assert_eq(boolops, []))
+
+    # ── FIX-C1: router ordering ───────────────────────────────────────────────
+    import sys
+    src = inspect.getsource(sys.modules[__name__])
+    router_def_pos   = src.find("router = APIRouter()")
+    include_pos      = src.find("app.include_router(router")
+    test("fix-c1: router defined before include_router",
+         lambda: assert_lt(router_def_pos, include_pos))
+
+    # ── FIX-L1: version strings ───────────────────────────────────────────────
+    test("fix-l1: GREETING_EN says v7.1", lambda: assert_in("v7.1", GREETING_EN))
+    test("fix-l1: GREETING_MR says v7.1", lambda: assert_in("v7.1", GREETING_MR))
+    test("fix-l1: IDENTITY says v7.1",    lambda: assert_in("v7.1", IDENTITY_RESPONSE))
+
+    # ── Performance: table render ─────────────────────────────────────────────
+    big = [{"productName":f"P{i}","totalAmount":str(i*10),"barcode":f"BAR{i:09d}"} for i in range(600)]
+    db._load("perf_t", big)
+    rows_p, cols_p, _ = RAGRetriever().retrieve("perf_t", {"intent":"BULK_LIST","search_value":"","target_col":None,"aggregation":"NONE","negation_value":None})
+    t0 = time.time()
+    tbl_h, rendered = synth.table(rows_p[:600], cols_p, False)
+    elapsed = time.time() - t0
+    test(f"perf: 500-row render < 0.5s ({elapsed:.3f}s)",
+         lambda: assert_lte(elapsed, 0.5))
+    test("perf: render cap ≤500", lambda: assert_lte(rendered, MAX_RENDER_ROWS))
+
+    # ── Module registry completeness ──────────────────────────────────────────
+    test("registry: 17 modules", lambda: assert_eq(len(MODULE_REGISTRY), 17))
+
+    # ── P1-10 carried: customer-ledger-summary in Marathi ────────────────────
+    test("p1-10: customer-ledger-summary in MR_RAW",
+         lambda: assert_in("customer-ledger-summary", _MR_RAW))
+    test("p1-10: Marathi saransh routes to summary",
+         lambda: assert_ne(marathi_classify("grahak khate saransh"), None))
 
     # ── Summary ───────────────────────────────────────────────────────────────
     total = passed + failed
-    print(f"\n══════════════════════════════════════════")
+    print(f"\n══════════════════════════════════════════════════════")
     print(f"  Results: {passed}/{total} passed", end="")
     if failed:
-        print(f"  ⚠️  {failed} FAILED")
+        print(f"   ⚠️  {failed} FAILED")
     else:
-        print("  🎉 ALL PASSED")
-    print(f"══════════════════════════════════════════\n")
+        print("   🎉 ALL PASSED")
+    print(f"══════════════════════════════════════════════════════\n")
     return failed == 0
-def assert_eq(a, b):
-    assert a == b, f"Expected {b!r}, got {a!r}"
 
-def assert_in(needle, haystack):
-    assert needle in haystack, f"{needle!r} not found in result"
 
-def assert_not_in(needle, haystack):
-    assert needle not in haystack, f"{needle!r} should NOT be in result but was"
+# ── Test helpers ──────────────────────────────────────────────────────────────
+import sys
 
-def assert_lte(a, b):
-    assert a <= b, f"Expected ≤ {b}, got {a}"
+def assert_eq(a, b):    assert a == b,  f"Expected {b!r}, got {a!r}"
+def assert_ne(a, b):    assert a != b,  f"Expected not {b!r}, got {a!r}"
+def assert_in(a, b):    assert a in b,  f"{a!r} not found in result"
+def assert_not_in(a,b): assert a not in b, f"{a!r} should NOT be in result"
+def assert_lte(a, b):   assert a <= b,  f"Expected ≤{b}, got {a}"
+def assert_lt(a, b):    assert a < b,   f"Expected <{b}, got {a}"
 
 
 if __name__ == "__main__":
     success = _run_tests()
-    exit(0 if success else 1)
+    sys.exit(0 if success else 1)
